@@ -5,7 +5,8 @@
       "Bash(dotnet add:*)",
       "Bash(dotnet build:*)",
       "Bash(git init:*)",
-      "Bash(git:*)"
+      "Bash(git:*)",
+      "Bash(dotnet sln add:*)"
     ]
   }
 }

@@ -1,19 +1,46 @@
+﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.5.2.0
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WebhookFx", "WebhookFx\WebhookFx.csproj", "{8D3DFE2C-AD82-1063-CED2-5B80ABC2B8FA}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OutboxProcessor", "OutboxProcessor\OutboxProcessor.csproj", "{F3E09D45-0A72-412D-B909-1168795AB897}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
+		Debug|x64 = Debug|x64
+		Debug|x86 = Debug|x86
 		Release|Any CPU = Release|Any CPU
+		Release|x64 = Release|x64
+		Release|x86 = Release|x86
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
 		{8D3DFE2C-AD82-1063-CED2-5B80ABC2B8FA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{8D3DFE2C-AD82-1063-CED2-5B80ABC2B8FA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8D3DFE2C-AD82-1063-CED2-5B80ABC2B8FA}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{8D3DFE2C-AD82-1063-CED2-5B80ABC2B8FA}.Debug|x64.Build.0 = Debug|Any CPU
+		{8D3DFE2C-AD82-1063-CED2-5B80ABC2B8FA}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{8D3DFE2C-AD82-1063-CED2-5B80ABC2B8FA}.Debug|x86.Build.0 = Debug|Any CPU
 		{8D3DFE2C-AD82-1063-CED2-5B80ABC2B8FA}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{8D3DFE2C-AD82-1063-CED2-5B80ABC2B8FA}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8D3DFE2C-AD82-1063-CED2-5B80ABC2B8FA}.Release|x64.ActiveCfg = Release|Any CPU
+		{8D3DFE2C-AD82-1063-CED2-5B80ABC2B8FA}.Release|x64.Build.0 = Release|Any CPU
+		{8D3DFE2C-AD82-1063-CED2-5B80ABC2B8FA}.Release|x86.ActiveCfg = Release|Any CPU
+		{8D3DFE2C-AD82-1063-CED2-5B80ABC2B8FA}.Release|x86.Build.0 = Release|Any CPU
+		{F3E09D45-0A72-412D-B909-1168795AB897}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F3E09D45-0A72-412D-B909-1168795AB897}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F3E09D45-0A72-412D-B909-1168795AB897}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{F3E09D45-0A72-412D-B909-1168795AB897}.Debug|x64.Build.0 = Debug|Any CPU
+		{F3E09D45-0A72-412D-B909-1168795AB897}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{F3E09D45-0A72-412D-B909-1168795AB897}.Debug|x86.Build.0 = Debug|Any CPU
+		{F3E09D45-0A72-412D-B909-1168795AB897}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F3E09D45-0A72-412D-B909-1168795AB897}.Release|Any CPU.Build.0 = Release|Any CPU
+		{F3E09D45-0A72-412D-B909-1168795AB897}.Release|x64.ActiveCfg = Release|Any CPU
+		{F3E09D45-0A72-412D-B909-1168795AB897}.Release|x64.Build.0 = Release|Any CPU
+		{F3E09D45-0A72-412D-B909-1168795AB897}.Release|x86.ActiveCfg = Release|Any CPU
+		{F3E09D45-0A72-412D-B909-1168795AB897}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

@@ -1,0 +1,10 @@
+{
+  "action": "sell",
+  "pair": "GOLD",
+  "entry_tag": "gold_strategy",
+  "alert_message": "Scripted Exit Long",
+  "comment": "Scripted Exit All",
+  "price": 4569.440,
+  "allow_multiple": true,
+  "lot": 0.01
+} 

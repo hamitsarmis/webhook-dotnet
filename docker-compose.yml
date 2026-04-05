@@ -1,0 +1,11 @@
+services:
+  webhookfx:
+    build:
+      context: ./WebhookFx
+      dockerfile: Dockerfile
+    ports:
+      - "8089:8089"
+    volumes:
+      - ./logs:/app/logs
+    env_file:
+      - .env

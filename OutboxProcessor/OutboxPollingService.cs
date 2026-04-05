@@ -8,7 +8,7 @@ public class OutboxPollingService : BackgroundService
 {
     private readonly string _connectionString;
     private readonly string _rabbitHost;
-    private readonly int _pollingIntervalMs;
+    private readonly int _fallbackIntervalMs;
     private readonly int _batchSize;
     private readonly ILogger<OutboxPollingService> _logger;
 
@@ -16,14 +16,16 @@ public class OutboxPollingService : BackgroundService
     {
         _connectionString = configuration.GetConnectionString("Default")!;
         _rabbitHost = configuration["RabbitMQ:Host"] ?? "localhost";
-        _pollingIntervalMs = int.Parse(configuration["Polling:IntervalMs"] ?? "5000");
+        _fallbackIntervalMs = int.Parse(configuration["Polling:FallbackIntervalMs"] ?? "30000");
         _batchSize = int.Parse(configuration["Polling:BatchSize"] ?? "50");
         _logger = logger;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("OutboxPollingService started. Polling every {Interval}ms", _pollingIntervalMs);
+        _logger.LogInformation(
+            "OutboxPollingService started. Using LISTEN/NOTIFY with {Fallback}ms fallback poll",
+            _fallbackIntervalMs);
 
         var factory = new ConnectionFactory { HostName = _rabbitHost };
         await using var rabbitConnection = await factory.CreateConnectionAsync(stoppingToken);
@@ -48,22 +50,71 @@ public class OutboxPollingService : BackgroundService
             routingKey: "signal.#",
             cancellationToken: stoppingToken);
 
+        // Dedicated Npgsql connection for LISTEN — must stay open
+        await using var listenConn = new NpgsqlConnection(_connectionString);
+        await listenConn.OpenAsync(stoppingToken);
+
+        await using (var listenCmd = listenConn.CreateCommand())
+        {
+            listenCmd.CommandText = "LISTEN outbox_new;";
+            await listenCmd.ExecuteNonQueryAsync(stoppingToken);
+        }
+
+        _logger.LogInformation("Listening on PostgreSQL channel 'outbox_new'");
+
+        var notificationReceived = new SemaphoreSlim(0);
+        listenConn.Notification += (_, _) => notificationReceived.Release();
+
+        // Process any events that were inserted before we started listening
+        await ProcessPendingEventsAsync(channel, stoppingToken);
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                await PollAndPublishAsync(channel, stoppingToken);
+                // Wait for a notification or fallback timeout
+                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+                timeoutCts.CancelAfter(_fallbackIntervalMs);
+
+                try
+                {
+                    await listenConn.WaitAsync(timeoutCts.Token);
+                }
+                catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
+                {
+                    // Fallback timeout — just poll
+                }
+
+                // Drain the semaphore so we don't loop unnecessarily
+                while (notificationReceived.CurrentCount > 0)
+                    notificationReceived.Wait(0);
+
+                await ProcessPendingEventsAsync(channel, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error during outbox polling");
+                _logger.LogError(ex, "Error during outbox processing");
+                await Task.Delay(1000, stoppingToken); // back off on error
             }
-
-            await Task.Delay(_pollingIntervalMs, stoppingToken);
         }
     }
 
-    private async Task PollAndPublishAsync(IChannel channel, CancellationToken ct)
+    private async Task ProcessPendingEventsAsync(IChannel channel, CancellationToken ct)
+    {
+        // Process in a loop until no more pending events (handles bursts > batch size)
+        while (true)
+        {
+            var processed = await PollAndPublishAsync(channel, ct);
+            if (processed == 0)
+                break;
+        }
+    }
+
+    private async Task<int> PollAndPublishAsync(IChannel channel, CancellationToken ct)
     {
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
@@ -94,7 +145,7 @@ public class OutboxPollingService : BackgroundService
         await reader.CloseAsync();
 
         if (events.Count == 0)
-            return;
+            return 0;
 
         _logger.LogInformation("Processing {Count} outbox events", events.Count);
 
@@ -126,6 +177,8 @@ public class OutboxPollingService : BackgroundService
                 await MarkFailedAsync(conn, evt.Id, ex.Message, ct);
             }
         }
+
+        return events.Count;
     }
 
     private static async Task MarkProcessedAsync(NpgsqlConnection conn, int eventId, CancellationToken ct)

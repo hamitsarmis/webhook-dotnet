@@ -54,6 +54,19 @@ public static class DbInitializer
                 "ErrorMessage"   TEXT,
                 "IdempotencyKey" VARCHAR(255) UNIQUE
             );
+
+            CREATE OR REPLACE FUNCTION notify_outbox_insert()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                PERFORM pg_notify('outbox_new', NEW."Id"::text);
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+
+            DROP TRIGGER IF EXISTS trg_outbox_notify ON "OutboxEvents";
+            CREATE TRIGGER trg_outbox_notify
+                AFTER INSERT ON "OutboxEvents"
+                FOR EACH ROW EXECUTE FUNCTION notify_outbox_insert();
             """;
         await cmd.ExecuteNonQueryAsync();
     }

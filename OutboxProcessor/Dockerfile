@@ -3,7 +3,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     update-ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY ["OutboxProcessor.csproj", "nuget.config", "./"]
-RUN DOTNET_SYSTEM_NET_HTTP_USESOCKETSHTTPHANDLER=0 dotnet restore
+ENV NUGET_CERT_REVOCATION_MODE=offline
+RUN dotnet restore
 COPY . .
 RUN dotnet publish -c Release -o /app/publish
 

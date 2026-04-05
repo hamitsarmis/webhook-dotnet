@@ -15,6 +15,14 @@ var fileTarget = new FileTarget("logfile")
     Layout = "${longdate} | ${level:uppercase=true} | ${message} ${exception:format=tostring}"
 };
 nlogConfig.AddRule(NLog.LogLevel.Error, NLog.LogLevel.Fatal, fileTarget);
+
+var accessTarget = new FileTarget("accesslog")
+{
+    FileName = "logs/access.log",
+    Layout = "${message}"
+};
+nlogConfig.AddRule(NLog.LogLevel.Info, NLog.LogLevel.Info, accessTarget, "AccessLog");
+
 LogManager.Configuration = nlogConfig;
 
 var logger = LogManager.GetCurrentClassLogger();
@@ -27,6 +35,19 @@ var connectionString = builder.Configuration.GetConnectionString("Default")!;
 await DbInitializer.InitializeAsync(connectionString);
 
 app.UseMiddleware<IpWhitelistMiddleware>();
+
+var accessLogger = LogManager.GetLogger("AccessLog");
+app.Use(async (context, next) =>
+{
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    await next();
+    sw.Stop();
+    var ip = context.Connection.RemoteIpAddress;
+    var method = context.Request.Method;
+    var path = context.Request.Path;
+    var status = context.Response.StatusCode;
+    accessLogger.Info($"{DateTime.UtcNow:O} | {ip} | {method} {path} | {status} | {sw.ElapsedMilliseconds}ms");
+});
 
 app.MapPost("/webhookfx", async (HttpContext context) =>
 {

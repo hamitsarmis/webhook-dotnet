@@ -23,7 +23,8 @@ public static class DbInitializer
                 "allow_multiple" BOOLEAN NOT NULL,
                 "size" DECIMAL NOT NULL,
                 "close_time" TIMESTAMP,
-                "close_price" DECIMAL
+                "close_price" DECIMAL,
+                "IdempotencyKey" VARCHAR(255) UNIQUE
             );
 
             CREATE TABLE IF NOT EXISTS "BadRequests" (
@@ -39,6 +40,19 @@ public static class DbInitializer
                 "request_date" TIMESTAMP NOT NULL,
                 "json" TEXT NOT NULL,
                 "is_valid" SMALLINT NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS "OutboxEvents" (
+                "Id"             SERIAL PRIMARY KEY,
+                "SignalId"       INT          NOT NULL REFERENCES "Signals"("Id"),
+                "EventType"      VARCHAR(100) NOT NULL DEFAULT 'signal.created',
+                "Payload"        JSONB        NOT NULL,
+                "RetryCount"     INT          NOT NULL DEFAULT 0,
+                "CreatedAt"      TIMESTAMP    NOT NULL DEFAULT NOW(),
+                "ProcessedAt"    TIMESTAMP,
+                "FailedAt"       TIMESTAMP,
+                "ErrorMessage"   TEXT,
+                "IdempotencyKey" VARCHAR(255) UNIQUE
             );
             """;
         await cmd.ExecuteNonQueryAsync();

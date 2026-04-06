@@ -19,7 +19,8 @@ nlogConfig.AddRule(NLog.LogLevel.Error, NLog.LogLevel.Fatal, fileTarget);
 var accessTarget = new FileTarget("accesslog")
 {
     FileName = "logs/access.log",
-    Layout = "${message}"
+    Layout = "${message}",
+    AutoFlush = true
 };
 nlogConfig.AddRule(NLog.LogLevel.Info, NLog.LogLevel.Info, accessTarget, "AccessLog");
 

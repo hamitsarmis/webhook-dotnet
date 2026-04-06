@@ -27,14 +27,6 @@ public static class DbInitializer
                 "IdempotencyKey" VARCHAR(255) UNIQUE
             );
 
-            CREATE TABLE IF NOT EXISTS "BadRequests" (
-                "Id" SERIAL PRIMARY KEY,
-                "timestamp" TIMESTAMP NOT NULL,
-                "request_type" VARCHAR(100) NOT NULL,
-                "body" TEXT NOT NULL,
-                "reason" VARCHAR(500) NOT NULL
-            );
-
             CREATE TABLE IF NOT EXISTS "Requests" (
                 "Id" SERIAL PRIMARY KEY,
                 "request_date" TIMESTAMP NOT NULL,

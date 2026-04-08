@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using Npgsql;
 using RabbitMQ.Client;
 
@@ -165,7 +166,7 @@ public class OutboxPollingService : BackgroundService
                     routingKey: evt.EventType,
                     mandatory: false,
                     basicProperties: props,
-                    body: Encoding.UTF8.GetBytes(evt.Payload),
+                    body: Encoding.UTF8.GetBytes(JsonSerializer.Serialize(evt)),
                     cancellationToken: ct);
 
                 await MarkProcessedAsync(conn, evt.Id, ct);

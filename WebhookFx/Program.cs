@@ -92,6 +92,73 @@ app.MapPost("/webhookfx", async (HttpContext context) =>
 
     if (!isCloseRequest)
     {
+        // Check for existing open position on this pair
+        await using var checkCmd = conn.CreateCommand();
+        checkCmd.Transaction = tx;
+        checkCmd.CommandText = """
+            SELECT "Id", "action" FROM "Signals"
+            WHERE "pair" = @pair AND "close_time" IS NULL
+            ORDER BY "open_time" DESC
+            LIMIT 1
+            """;
+        checkCmd.Parameters.AddWithValue("pair", request.Pair);
+
+        int? existingId = null;
+        string? existingAction = null;
+        await using (var rdr = await checkCmd.ExecuteReaderAsync())
+        {
+            if (await rdr.ReadAsync())
+            {
+                existingId = rdr.GetInt32(0);
+                existingAction = rdr.GetString(1);
+            }
+        }
+
+        if (existingId is not null)
+        {
+            bool sameDirection =
+                (existingAction!.Contains("Long", StringComparison.OrdinalIgnoreCase)
+                 && request.Action.Contains("Long", StringComparison.OrdinalIgnoreCase))
+                || (existingAction.Contains("Short", StringComparison.OrdinalIgnoreCase)
+                    && request.Action.Contains("Short", StringComparison.OrdinalIgnoreCase));
+
+            if (sameDirection)
+            {
+                await tx.RollbackAsync();
+                _ = LogRequestAsync(connectionString, rawBody, isValid: true, logger);
+                return Results.Ok("Position already open in the same direction.");
+            }
+
+            // Opposite direction: close existing position first
+            await using var closeCmd = conn.CreateCommand();
+            closeCmd.Transaction = tx;
+            closeCmd.CommandText = """
+                UPDATE "Signals"
+                SET "close_time" = @close_time, "close_price" = @close_price
+                WHERE "Id" = @id
+                RETURNING "Id"
+                """;
+            closeCmd.Parameters.AddWithValue("close_time", DateTime.UtcNow);
+            closeCmd.Parameters.AddWithValue("close_price", request.Price);
+            closeCmd.Parameters.AddWithValue("id", existingId.Value);
+            var closedId = (int)(await closeCmd.ExecuteScalarAsync())!;
+
+            var closeIdempotencyKey = Convert.ToHexString(
+                SHA256.HashData(Encoding.UTF8.GetBytes($"reversal_close_{closedId}_{openTime:O}")))[..32];
+
+            await using var closeOutboxCmd = conn.CreateCommand();
+            closeOutboxCmd.Transaction = tx;
+            closeOutboxCmd.CommandText = """
+                INSERT INTO "OutboxEvents" ("SignalId", "EventType", "Payload", "IdempotencyKey")
+                VALUES (@signal_id, 'signal.closed', @payload::jsonb, @idempotency_key)
+                """;
+            closeOutboxCmd.Parameters.AddWithValue("signal_id", closedId);
+            closeOutboxCmd.Parameters.AddWithValue("payload", rawBody);
+            closeOutboxCmd.Parameters.AddWithValue("idempotency_key", closeIdempotencyKey);
+            await closeOutboxCmd.ExecuteNonQueryAsync();
+        }
+
+        // Open the new position
         await using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
         cmd.CommandText = """
@@ -128,7 +195,9 @@ app.MapPost("/webhookfx", async (HttpContext context) =>
 
         await tx.CommitAsync();
         _ = LogRequestAsync(connectionString, rawBody, isValid: true, logger);
-        return Results.Ok("Position opened.");
+        return existingId is not null
+            ? Results.Ok("Position reversed.")
+            : Results.Ok("Position opened.");
     }
     else
     {

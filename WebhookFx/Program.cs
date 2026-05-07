@@ -35,8 +35,6 @@ var connectionString = builder.Configuration.GetConnectionString("Default")!;
 
 await DbInitializer.InitializeAsync(connectionString);
 
-app.UseMiddleware<IpWhitelistMiddleware>();
-
 var accessLogger = LogManager.GetLogger("AccessLog");
 app.Use(async (context, next) =>
 {
@@ -49,6 +47,8 @@ app.Use(async (context, next) =>
     var status = context.Response.StatusCode;
     accessLogger.Info($"{DateTime.UtcNow:O} | {ip} | {method} {path} | {status} | {sw.ElapsedMilliseconds}ms");
 });
+
+app.UseMiddleware<IpWhitelistMiddleware>();
 
 app.MapPost("/webhookfx", async (HttpContext context) =>
 {

@@ -27,6 +27,22 @@ services:
       rabbitmq:
         condition: service_healthy
 
+  signal-processor:
+    build:
+      context: ./signal_processor
+      dockerfile: Dockerfile
+    env_file:
+      - ./signal_processor/.env
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USERNAME: guest
+      RABBITMQ_PASSWORD: guest
+      RABBITMQ_EXCHANGE: signals
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
   postgres:
     image: postgres:17
     environment:

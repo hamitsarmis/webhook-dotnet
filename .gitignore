@@ -72,3 +72,6 @@ Desktop.ini
 
 # Python
 __pycache__/
+
+# Local env files
+.env

@@ -1,7 +1,9 @@
 import asyncio
+import concurrent.futures
 import logging
 import os
 import random
+import threading
 from typing import Optional, Literal, Dict, Any
 import traceback
 from datetime import datetime, timezone
@@ -9,6 +11,168 @@ from datetime import datetime, timezone
 from metaapi_cloud_sdk import MetaApi
 
 Side = Literal["buy", "sell"]
+
+
+class _ConnectionWorker:
+  """
+  Owns a dedicated OS thread, asyncio event loop, MetaApi client, and RPC
+  connection. Used to isolate background work (heartbeat, trade manager) from
+  the trading-path connection so RPCs never queue behind monitoring traffic
+  on a shared socket.
+
+  Thread/loop lifecycle:
+    - start_thread()              : spawn the thread, block until its loop is up
+    - submit(coro)                : schedule a coroutine on this worker's loop
+                                    from any thread; returns concurrent Future
+    - stop_thread_and_join()      : disconnect, stop the loop, join the thread
+  """
+
+  def __init__(
+    self,
+    name: str,
+    token: str,
+    account_id: str,
+    log: logging.Logger,
+    parent_stop: threading.Event,
+    *,
+    rpc_timeout_sec: float,
+    ready_wait_timeout_sec: float,
+    reconnect_base_delay_sec: float,
+    reconnect_max_delay_sec: float,
+  ):
+    self.name = name
+    self.token = token
+    self.account_id = account_id
+    self.log = log
+    self.parent_stop = parent_stop
+
+    self.rpc_timeout_sec = rpc_timeout_sec
+    self.ready_wait_timeout_sec = ready_wait_timeout_sec
+    self.reconnect_base_delay_sec = reconnect_base_delay_sec
+    self.reconnect_max_delay_sec = reconnect_max_delay_sec
+
+    self.loop: Optional[asyncio.AbstractEventLoop] = None
+    self.thread: Optional[threading.Thread] = None
+    self._loop_started = threading.Event()
+
+    self._api: Optional[MetaApi] = None
+    self._account = None
+    self.conn = None
+
+    # Created on the worker's own loop in _run_loop.
+    self._ready: Optional[asyncio.Event] = None
+    self._reconnect_lock: Optional[asyncio.Lock] = None
+
+  def start_thread(self, timeout: float = 5.0) -> None:
+    self.thread = threading.Thread(
+      target=self._run_loop,
+      name=f"forexmanager-{self.name}",
+      daemon=True,
+    )
+    self.thread.start()
+    if not self._loop_started.wait(timeout=timeout):
+      raise RuntimeError(f"[{self.name}] worker loop failed to start within {timeout}s")
+
+  def _run_loop(self) -> None:
+    self.loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(self.loop)
+    self._ready = asyncio.Event()
+    self._reconnect_lock = asyncio.Lock()
+    self._loop_started.set()
+    try:
+      self.loop.run_forever()
+    finally:
+      try:
+        pending = asyncio.all_tasks(self.loop)
+        for t in pending:
+          t.cancel()
+        if pending:
+          self.loop.run_until_complete(
+            asyncio.gather(*pending, return_exceptions=True)
+          )
+      except Exception:
+        pass
+      self.loop.close()
+
+  def submit(self, coro) -> concurrent.futures.Future:
+    if self.loop is None:
+      raise RuntimeError(f"[{self.name}] worker loop not started")
+    return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+  async def connect_and_sync(self) -> None:
+    self._ready.clear()
+    self.log.warning("[%s] Connecting to MetaApi...", self.name)
+    self._api = MetaApi(self.token)
+    self._account = await self._api.metatrader_account_api.get_account(self.account_id)
+    if self._account.state != "DEPLOYED":
+      self.log.warning("[%s] Account not deployed, deploying...", self.name)
+      await self._account.deploy()
+    self.log.warning("[%s] Waiting for MetaApi server connection...", self.name)
+    await self._account.wait_connected()
+    self.log.warning("[%s] Creating RPC connection...", self.name)
+    self.conn = self._account.get_rpc_connection()
+    await self.conn.connect()
+    self.log.warning("[%s] Waiting for synchronization...", self.name)
+    await self.conn.wait_synchronized()
+    self.log.warning("[%s] READY ✅", self.name)
+    self._ready.set()
+
+  async def disconnect(self) -> None:
+    self._ready.clear()
+    try:
+      if self.conn:
+        await self.conn.close()
+        await asyncio.sleep(1)
+    except Exception:
+      pass
+    self.conn = None
+    self._account = None
+    self._api = None
+
+  async def trigger_reconnect(self) -> None:
+    async with self._reconnect_lock:
+      if self.parent_stop.is_set():
+        return
+      if self._ready.is_set():
+        return
+      self._ready.clear()
+      delay = self.reconnect_base_delay_sec
+      while not self.parent_stop.is_set():
+        try:
+          await self.disconnect()
+          await self.connect_and_sync()
+          return
+        except Exception as e:
+          jitter = random.uniform(0, 0.5)
+          sleep_for = min(self.reconnect_max_delay_sec, delay + jitter)
+          self.log.warning(
+            "[%s] Reconnect failed (%s). Retrying in %.1fs...",
+            self.name, repr(e), sleep_for,
+          )
+          await asyncio.sleep(sleep_for)
+          delay = min(self.reconnect_max_delay_sec, delay * 2)
+
+  async def ensure_ready(self) -> None:
+    if self._ready.is_set():
+      return
+    try:
+      await asyncio.wait_for(self._ready.wait(), timeout=self.ready_wait_timeout_sec)
+    except asyncio.TimeoutError:
+      raise RuntimeError(
+        f"[{self.name}] not ready after {self.ready_wait_timeout_sec}s"
+      )
+
+  async def stop_thread_and_join(self, timeout: float = 10.0) -> None:
+    """Disconnect, stop the loop, join the thread. Safe to call from main loop."""
+    if self.loop and self.loop.is_running():
+      try:
+        fut = asyncio.run_coroutine_threadsafe(self.disconnect(), self.loop)
+        await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
+      except Exception:
+        pass
+      self.loop.call_soon_threadsafe(self.loop.stop)
+    if self.thread:
+      await asyncio.to_thread(self.thread.join, timeout)
 
 
 class ForexManager:
@@ -70,15 +234,46 @@ class ForexManager:
     self._conn = None
 
     self._ready = asyncio.Event()
-    self._stop = asyncio.Event()
-    self._heartbeat_task: Optional[asyncio.Task] = None
+    # threading.Event so the heartbeat / trade-manager threads can read it.
+    self._stop = threading.Event()
+    self._heartbeat_task: Optional[concurrent.futures.Future] = None
 
-    # only one reconnect attempt at a time
+    # only one reconnect attempt at a time (trading conn)
     self._reconnect_lock = asyncio.Lock()
+
+    # Cross-thread protection for shared state mutated by trading thread
+    # (open_market_order, close_all_positions) AND trade-manager thread
+    # (_manage_all_positions, _check_closed_positions_profit).
+    self._state_lock = threading.Lock()
+
+    # Dedicated workers (own thread + loop + RPC connection) so monitoring
+    # traffic never queues behind trading RPCs on the shared socket.
+    self._hb_worker = _ConnectionWorker(
+      name="heartbeat",
+      token=token,
+      account_id=account_id,
+      log=self.log,
+      parent_stop=self._stop,
+      rpc_timeout_sec=self.rpc_timeout_sec,
+      ready_wait_timeout_sec=self.ready_wait_timeout_sec,
+      reconnect_base_delay_sec=self.reconnect_base_delay_sec,
+      reconnect_max_delay_sec=self.reconnect_max_delay_sec,
+    )
+    self._tm_worker = _ConnectionWorker(
+      name="trade-manager",
+      token=token,
+      account_id=account_id,
+      log=self.log,
+      parent_stop=self._stop,
+      rpc_timeout_sec=self.rpc_timeout_sec,
+      ready_wait_timeout_sec=self.ready_wait_timeout_sec,
+      reconnect_base_delay_sec=self.reconnect_base_delay_sec,
+      reconnect_max_delay_sec=self.reconnect_max_delay_sec,
+    )
 
     # Trade management state: {position_id: {"open_price", "direction", "symbol", "volume", "peak_profit"}}
     self._trade_state: Dict[str, Dict[str, Any]] = {}
-    self._trade_manager_task: Optional[asyncio.Task] = None
+    self._trade_manager_task: Optional[concurrent.futures.Future] = None
     self._trade_manager_interval_sec = 5  # Check every 5 seconds
 
     # --- MFE/MAE-optimized parameters from 90-day backtest ---
@@ -106,33 +301,39 @@ class ForexManager:
   # Public lifecycle
   # ----------------------------
   async def start(self) -> None:
-    """Connects and starts heartbeat and trade management tasks."""
+    """Connects trading conn, then spawns heartbeat & trade-manager workers
+    each on its own dedicated thread + event loop + RPC connection."""
     self._stop.clear()
+
+    # 1. Trading connection — lives on the caller's (main) event loop.
     await self._connect_and_sync()
-    self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="forexmanager-heartbeat")
+
+    # 2. Heartbeat worker — own thread, own connection.
+    self._hb_worker.start_thread()
+    await asyncio.wrap_future(self._hb_worker.submit(self._hb_worker.connect_and_sync()))
+    self._heartbeat_task = self._hb_worker.submit(self._heartbeat_loop())
+
+    # 3. Trade manager worker — own thread, own connection.
     if self.enable_trade_manager:
-      self._trade_manager_task = asyncio.create_task(self._trade_manager_loop(), name="forexmanager-trade-manager")
+      self._tm_worker.start_thread()
+      await asyncio.wrap_future(self._tm_worker.submit(self._tm_worker.connect_and_sync()))
+      self._trade_manager_task = self._tm_worker.submit(self._trade_manager_loop())
     else:
       self.log.warning("Trade manager disabled (set ENABLE_TRADE_MANAGER=1 to enable)")
 
   async def stop(self) -> None:
-    """Stops heartbeat and closes connection."""
+    """Stops heartbeat & trade-manager workers and closes trading connection."""
     self._stop.set()
-    if self._heartbeat_task:
-      self._heartbeat_task.cancel()
-      try:
-        await self._heartbeat_task
-      except asyncio.CancelledError:
-        pass
-      self._heartbeat_task = None
 
-    if self._trade_manager_task:
+    if self._heartbeat_task is not None:
+      self._heartbeat_task.cancel()
+      self._heartbeat_task = None
+    await self._hb_worker.stop_thread_and_join()
+
+    if self._trade_manager_task is not None:
       self._trade_manager_task.cancel()
-      try:
-        await self._trade_manager_task
-      except asyncio.CancelledError:
-        pass
       self._trade_manager_task = None
+    await self._tm_worker.stop_thread_and_join()
 
     await self._disconnect()
 
@@ -254,26 +455,28 @@ class ForexManager:
         self.log.warning(f"Set SL={sl:.2f}, TP={tp:.2f} for position {position_id} (distance={sl_distance:.1f})")
 
     if update_last_signal:
-        self.last_signal = {
-            "date_created": datetime.now(timezone.utc).isoformat(),
-            "action": side,
-            "price": open_price,
-            "first_entry_price": open_price,
-            "symbol": symbol,
-            "volume": volume,
-            "has_profit": False,
-            "has_pending_order": False,
-        }
+        with self._state_lock:
+          self.last_signal = {
+              "date_created": datetime.now(timezone.utc).isoformat(),
+              "action": side,
+              "price": open_price,
+              "first_entry_price": open_price,
+              "symbol": symbol,
+              "volume": volume,
+              "has_profit": False,
+              "has_pending_order": False,
+          }
         await self.delete_all_pending_orders()
         self.log.warning(f"Last signal set: {self.last_signal}")
 
-    self._trade_state[position_id] = {
-        "open_price": open_price,
-        "direction": side,
-        "symbol": symbol,
-        "volume": volume,
-        "peak_profit": 0.0,
-    }
+    with self._state_lock:
+      self._trade_state[position_id] = {
+          "open_price": open_price,
+          "direction": side,
+          "symbol": symbol,
+          "volume": volume,
+          "peak_profit": 0.0,
+      }
     self.log.warning(
         f"Trade state for {position_id}: entry={open_price}, dir={side}, "
         f"SL={sl_distance:.1f}, BE={self.breakeven_profit:.1f}, "
@@ -385,7 +588,8 @@ class ForexManager:
               return_exceptions=True,
             )
           await self.delete_all_pending_orders()
-          self.last_signal = None
+          with self._state_lock:
+            self.last_signal = None
         finally:
           for lock in acquired:
             lock.release()
@@ -433,27 +637,25 @@ class ForexManager:
 
   async def _heartbeat_loop(self) -> None:
     """
-    Tests connection health by calling get_account_information.
-    If there is an issue, reconnects automatically.
+    Runs on the heartbeat worker's own thread+loop, using its dedicated RPC
+    connection — never queues behind trading or trade-manager traffic.
     """
     self.log.warning("Heartbeat started (%ss interval)", self.heartbeat_interval_sec)
 
     while not self._stop.is_set():
       await asyncio.sleep(self.heartbeat_interval_sec)
 
-      if not self._ready.is_set() or self._conn is None:
+      if not self._hb_worker._ready.is_set() or self._hb_worker.conn is None:
         continue
 
       try:
-        # The most reliable way: an RPC call
-        # such as get_account_information / get_symbol_price / get_positions.
         await asyncio.wait_for(
-          self._conn.get_account_information(),
+          self._hb_worker.conn.get_account_information(),
           timeout=self.rpc_timeout_sec,
         )
       except Exception as e:
         self.log.warning("Heartbeat check failed (%s). Reconnecting...", repr(e))
-        await self._trigger_reconnect()
+        await self._hb_worker.trigger_reconnect()
 
     self.log.warning("Heartbeat stopped.")
 
@@ -462,13 +664,8 @@ class ForexManager:
   # ----------------------------
   async def _trade_manager_loop(self) -> None:
     """
-    Background task that monitors positions and applies PFE (Peak Favorable Excursion) strategy.
-
-    Rules:
-    - Track how far price moved in our favor from entry (peak excursion)
-    - Trailing stop adjusts SL as profit grows
-    - On SL hit: re-enter at original entry via limit order
-    - Peak tracking resets on each new cycle
+    Runs on the trade-manager worker's own thread+loop, using its dedicated
+    RPC connection — never queues behind trading or heartbeat traffic.
     """
     self.log.warning("Trade manager started (%ss interval)", self._trade_manager_interval_sec)
 
@@ -476,8 +673,8 @@ class ForexManager:
       try:
         await asyncio.sleep(self._trade_manager_interval_sec)
 
-        if not self._ready.is_set():
-          self.log.warning("Ready is not set")
+        if not self._tm_worker._ready.is_set():
+          self.log.warning("Trade manager: tm conn not ready")
           continue
 
         await asyncio.wait_for(self._manage_all_positions(), timeout=30)
@@ -493,12 +690,13 @@ class ForexManager:
     self.log.warning("Trade manager stopped.")
 
   async def _manage_all_positions(self) -> None:
-    """Check all open positions and apply trailing stop logic."""
-    if not self._ready.is_set() or self._conn is None:
+    """Check all open positions and apply trailing stop logic.
+    Runs on the trade-manager worker's loop using `_tm_worker.conn`."""
+    if not self._tm_worker._ready.is_set() or self._tm_worker.conn is None:
       return
 
     try:
-      positions = await self._conn.get_positions()
+      positions = await self._tm_worker.conn.get_positions()
     except Exception as e:
       self.log.warning("Failed to get positions for management: %s", repr(e))
       return
@@ -510,7 +708,10 @@ class ForexManager:
         self.log.warning("No positions - trade manager interval set to 5s")
 
       # Check closed positions profit if last_signal exists and has_profit is False
-      if self.last_signal is not None and not self.last_signal.get("has_profit"):
+      with self._state_lock:
+        signal = self.last_signal
+        should_check = signal is not None and not signal.get("has_profit")
+      if should_check:
         await self._check_closed_positions_profit()
     else:
       if self._trade_manager_interval_sec != 1:
@@ -518,32 +719,34 @@ class ForexManager:
         self.log.warning(f"Positions found ({len(positions)}) - trade manager interval set to 1s")
 
       # If a position exists, any prior "pending order" should be considered resolved.
-      if self.last_signal is not None:
-        self.last_signal["has_pending_order"] = False
+      with self._state_lock:
+        if self.last_signal is not None:
+          self.last_signal["has_pending_order"] = False
 
-    # Clean up state for closed positions
+    # Clean up state for closed positions + register re-entries (single critical section).
     open_position_ids = {p.get("id") for p in positions}
-    closed_ids = [pid for pid in self._trade_state if pid not in open_position_ids]
-    for pid in closed_ids:
-      del self._trade_state[pid]
-      self.log.warning(f"Position {pid} closed, removed from trade state")
+    with self._state_lock:
+      closed_ids = [pid for pid in self._trade_state if pid not in open_position_ids]
+      for pid in closed_ids:
+        del self._trade_state[pid]
+        self.log.warning(f"Position {pid} closed, removed from trade state")
+
+      for position in positions:
+        pos_id = position.get("id")
+        if pos_id and pos_id not in self._trade_state:
+          symbol = position.get("symbol")
+          if symbol in self._pending_reentry:
+            reentry = self._pending_reentry.pop(symbol)
+            self._trade_state[pos_id] = {
+                "open_price": reentry["entry_price"],
+                "direction": reentry["direction"],
+                "symbol": symbol,
+                "volume": reentry["volume"],
+                "peak_profit": 0.0,
+            }
+            self.log.warning(f"Re-entry detected for {symbol}: position {pos_id} initialized with entry={reentry['entry_price']}")
 
     for position in positions:
-      pos_id = position.get("id")
-      # If position is untracked, check if it's a re-entry from a pending limit order
-      if pos_id and pos_id not in self._trade_state:
-        symbol = position.get("symbol")
-        if symbol in self._pending_reentry:
-          reentry = self._pending_reentry.pop(symbol)
-          self._trade_state[pos_id] = {
-              "open_price": reentry["entry_price"],
-              "direction": reentry["direction"],
-              "symbol": symbol,
-              "volume": reentry["volume"],
-              "peak_profit": 0.0,
-          }
-          self.log.warning(f"Re-entry detected for {symbol}: position {pos_id} initialized with entry={reentry['entry_price']}")
-
       await self._manage_single_position(position)
 
   async def _manage_single_position(self, position: Dict[str, Any]) -> None:
@@ -565,21 +768,20 @@ class ForexManager:
       self.log.warning(f"Position id {position_id} doesn't exist, returning...")
       return
 
-    if position_id not in self._trade_state:
-      self.log.warning(f"Position id {position_id} isn't in trade state, returning...")
-      return
+    with self._state_lock:
+      if position_id not in self._trade_state:
+        self.log.warning(f"Position id {position_id} isn't in trade state, returning...")
+        return
+      state = self._trade_state[position_id]
+      open_price = state["open_price"]
+      direction = state["direction"]
+      current_profit = position.get("profit", 0) or 0
 
-    state = self._trade_state[position_id]
-    open_price = state["open_price"]
-    direction = state["direction"]
-    current_profit = position.get("profit", 0) or 0
+      if current_profit > state["peak_profit"]:
+        state["peak_profit"] = current_profit
+        self.log.info(f"New peak profit for {position_id}: {current_profit:.2f}")
 
-    # Update peak profit tracker
-    if current_profit > state["peak_profit"]:
-      state["peak_profit"] = current_profit
-      self.log.info(f"New peak profit for {position_id}: {current_profit:.2f}")
-
-    peak_profit = state["peak_profit"]
+      peak_profit = state["peak_profit"]
 
     self.log.info(f"Managing {position_id}: entry={open_price}, dir={direction}, profit={current_profit:.2f}, peak={peak_profit:.2f}")
 
@@ -611,7 +813,7 @@ class ForexManager:
 
     try:
       await asyncio.wait_for(
-        self._conn.modify_position(position_id, stop_loss=new_sl),
+        self._tm_worker.conn.modify_position(position_id, stop_loss=new_sl),
         timeout=self.rpc_timeout_sec,
       )
       self.log.warning(f"Trailing SL for {position_id}: profit={current_profit:.2f}, peak={peak_profit:.2f}, new SL={new_sl:.2f}")
@@ -626,17 +828,26 @@ class ForexManager:
       last close price + 1 (momentum confirmation) to capture remaining move.
     - If SL was hit (profit < 0): place re-entry at first_entry_price with SL.
     - Repeats until a new signal arrives.
+
+    Runs on the trade-manager worker's loop using `_tm_worker.conn`.
     """
-    if self.last_signal is None:
-      self.log.warning("_check_closed_positions_profit: last_signal is None, returning")
+    # Snapshot last_signal under lock — trading thread may mutate or clear it.
+    with self._state_lock:
+      if self.last_signal is None:
+        self.log.warning("_check_closed_positions_profit: last_signal is None, returning")
+        return
+      sig = dict(self.last_signal)
+
+    conn = self._tm_worker.conn
+    if conn is None:
       return
 
     try:
-      signal_date = datetime.fromisoformat(self.last_signal["date_created"])
+      signal_date = datetime.fromisoformat(sig["date_created"])
       if signal_date.tzinfo is None:
         signal_date = signal_date.replace(tzinfo=timezone.utc)
 
-      history = await self._conn.get_deals_by_time_range(signal_date, datetime.now(timezone.utc))
+      history = await conn.get_deals_by_time_range(signal_date, datetime.now(timezone.utc))
 
       if not history:
         self.log.warning("_check_closed_positions_profit: No history deals found, returning")
@@ -667,10 +878,13 @@ class ForexManager:
       if total_profit >= 0:
         if total_profit >= 100000:
           # Signal complete
-          self.last_signal["has_profit"] = True
+          with self._state_lock:
+            if self.last_signal is not None:
+              self.last_signal["has_profit"] = True
           self.log.warning(f"Profit: {total_profit:.2f}. Signal complete.")
-          await self.delete_all_pending_orders()
-          self.last_signal = None
+          await self.delete_all_pending_orders(conn=conn)
+          with self._state_lock:
+            self.last_signal = None
           return
         else:
           # Profit below threshold — re-enter at close price + 1 for momentum confirmation
@@ -680,23 +894,25 @@ class ForexManager:
           # Fall through to re-entry logic below with close price
 
       # Re-entry logic (SL hit or under-target profit)
-      if self.last_signal.get("has_pending_order"):
+      if sig.get("has_pending_order"):
         # Verify the order still exists before trusting the flag
         try:
-          orders = await self._conn.get_orders()
+          orders = await conn.get_orders()
           if orders and len(orders) > 0:
             self.log.warning(f"Re-entry pending (profit={total_profit:.2f}), order still exists, returning")
             return
           else:
-            self.last_signal["has_pending_order"] = False
+            with self._state_lock:
+              if self.last_signal is not None:
+                self.last_signal["has_pending_order"] = False
             self.log.warning("Pending order no longer exists, will re-create re-entry order")
         except Exception:
           return
 
-      side = self.last_signal["action"]
-      first_entry = self.last_signal["first_entry_price"]
-      symbol = self.last_signal.get("symbol", "GOLD")
-      volume = self.last_signal.get("volume", 0.01)
+      side = sig["action"]
+      first_entry = sig["first_entry_price"]
+      symbol = sig.get("symbol", "GOLD")
+      volume = sig.get("volume", 0.01)
 
       sl_dist = self.initial_sl_distance
 
@@ -720,7 +936,7 @@ class ForexManager:
         sl = reentry_price + sl_dist
 
       # Get current price to decide between limit and stop order
-      price_data = await self._conn.get_symbol_price(symbol)
+      price_data = await conn.get_symbol_price(symbol)
       current_ask = price_data["ask"]
       current_bid = price_data["bid"]
 
@@ -732,33 +948,35 @@ class ForexManager:
       try:
         if side == "buy":
           if reentry_price < current_ask:
-            order_response = await self._conn.create_limit_buy_order(
+            order_response = await conn.create_limit_buy_order(
               symbol=symbol, volume=volume, open_price=reentry_price,
               stop_loss=sl,
             )
           else:
-            order_response = await self._conn.create_stop_buy_order(
+            order_response = await conn.create_stop_buy_order(
               symbol=symbol, volume=volume, open_price=reentry_price,
               stop_loss=sl,
             )
         else:
           if reentry_price > current_bid:
-            order_response = await self._conn.create_limit_sell_order(
+            order_response = await conn.create_limit_sell_order(
               symbol=symbol, volume=volume, open_price=reentry_price,
               stop_loss=sl,
             )
           else:
-            order_response = await self._conn.create_stop_sell_order(
+            order_response = await conn.create_stop_sell_order(
               symbol=symbol, volume=volume, open_price=reentry_price,
               stop_loss=sl,
             )
 
-        self.last_signal["has_pending_order"] = True
-        self._pending_reentry[symbol] = {
-            "entry_price": reentry_price,
-            "direction": side,
-            "volume": volume,
-        }
+        with self._state_lock:
+          if self.last_signal is not None:
+            self.last_signal["has_pending_order"] = True
+          self._pending_reentry[symbol] = {
+              "entry_price": reentry_price,
+              "direction": side,
+              "volume": volume,
+          }
         self.log.warning(f"Re-entry order created ({reason}): {order_response}")
 
       except Exception as order_error:
@@ -769,17 +987,24 @@ class ForexManager:
       self.log.warning(f"Error checking closed positions profit: {e}")
       traceback.print_exc()
 
-  async def delete_all_pending_orders(self) -> Dict[str, Any]:
+  async def delete_all_pending_orders(self, conn=None) -> Dict[str, Any]:
     """
     Delete all pending/limit orders.
-    Returns a dict with status and details of deleted orders.
+
+    `conn`: optional MetaApi RPC connection to use. If None (default), uses
+    the trading connection — that's the case for trading-thread callers.
+    Trade-manager-thread callers pass `self._tm_worker.conn` so deletion
+    runs on its own socket without contending with trading RPCs.
     """
-    await self._ensure_ready()
-    
+    is_trading_conn = conn is None
+    if is_trading_conn:
+      await self._ensure_ready()
+      conn = self._conn
+
     try:
       # Get all pending orders
       orders = await asyncio.wait_for(
-        self._conn.get_orders(),
+        conn.get_orders(),
         timeout=self.rpc_timeout_sec,
       )
 
@@ -792,7 +1017,7 @@ class ForexManager:
       async def _cancel(oid: str):
         try:
           await asyncio.wait_for(
-            self._conn.cancel_order(oid),
+            conn.cancel_order(oid),
             timeout=self.rpc_timeout_sec,
           )
           self.log.warning(f"Deleted pending order: {oid}")
@@ -805,8 +1030,9 @@ class ForexManager:
       deleted_orders = [oid for oid in results if oid]
 
       # Reset has_pending_order flag in last_signal if exists
-      if self.last_signal is not None:
-        self.last_signal["has_pending_order"] = False
+      with self._state_lock:
+        if self.last_signal is not None:
+          self.last_signal["has_pending_order"] = False
 
       self.log.warning(f"Deleted {len(deleted_orders)} pending orders")
       return {
@@ -816,8 +1042,9 @@ class ForexManager:
       }
 
     except asyncio.TimeoutError as e:
-      self.log.warning("delete_all_pending_orders timed out. Triggering reconnect...")
-      await self._trigger_reconnect()
+      self.log.warning("delete_all_pending_orders timed out.")
+      if is_trading_conn:
+        await self._trigger_reconnect()
       return {"status": "error", "error": "timeout"}
     except Exception as e:
       self.log.warning(f"Error deleting pending orders: {e}")

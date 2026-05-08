@@ -54,7 +54,7 @@ async def _process_signal(event_type, signal, forex_manager):
         logger.info("[CLOSE] %s %s %s @ %s | tag=%s comment=\"%s\"",
                     signal['action'].upper(), signal['lot'], signal['pair'],
                     signal['price'], signal.get('entry_tag'), signal.get('comment'))
-        await forex_manager.close_all_positions()
+        await forex_manager.close_positions_for_symbol(signal['pair'])
     elif event_type == "signal.created":
         logger.info("[OPEN] %s %s %s @ %s | tag=%s comment=\"%s\"",
                     signal['action'].upper(), signal['lot'], signal['pair'],

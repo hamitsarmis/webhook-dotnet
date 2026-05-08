@@ -562,6 +562,54 @@ class ForexManager:
           raise
         await asyncio.sleep(poll_interval_sec)
 
+  async def close_positions_for_symbol(self, symbol: str) -> None:
+    """
+    Atomically closes every open position for `symbol` and deletes pending
+    orders for that symbol. Other symbols are unaffected. Serializes with
+    open_market_order(symbol) via the per-symbol lock and waits for any
+    in-progress close_all_positions() to finish first.
+    """
+    await self._ensure_ready()
+    await self._wait_for_close_all_done()
+
+    sym_lock = self._get_symbol_lock(symbol)
+    async with sym_lock:
+      positions = await self.get_positions()
+      symbol_positions = [p for p in (positions or []) if p.get("symbol") == symbol]
+      if symbol_positions:
+        await asyncio.gather(
+          *(self.close_position_market(pos["id"]) for pos in symbol_positions),
+          return_exceptions=True,
+        )
+
+      try:
+        orders = await asyncio.wait_for(
+          self._conn.get_orders(),
+          timeout=self.rpc_timeout_sec,
+        )
+        symbol_order_ids = [
+          o["id"] for o in (orders or [])
+          if o.get("symbol") == symbol and o.get("id")
+        ]
+        if symbol_order_ids:
+          async def _cancel(oid: str):
+            try:
+              await asyncio.wait_for(
+                self._conn.cancel_order(oid),
+                timeout=self.rpc_timeout_sec,
+              )
+              self.log.warning(f"Deleted pending order: {oid}")
+            except Exception as e:
+              self.log.warning(f"Failed to delete order {oid}: {e}")
+          await asyncio.gather(*(_cancel(oid) for oid in symbol_order_ids))
+      except Exception as e:
+        self.log.warning(f"Error cancelling pending orders for {symbol}: {e}")
+
+      with self._state_lock:
+        if self.last_signal is not None and self.last_signal.get("symbol") == symbol:
+          self.last_signal = None
+        self._pending_reentry.pop(symbol, None)
+
   async def close_all_positions(self) -> None:
     """
     Atomically closes every open position and deletes pending orders.

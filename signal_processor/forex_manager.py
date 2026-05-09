@@ -10,6 +10,7 @@ import traceback
 from datetime import datetime, timezone
 
 from metaapi_cloud_sdk import MetaApi
+from metaapi_cloud_sdk.clients.error_handler import ValidationException
 
 Side = Literal["buy", "sell"]
 
@@ -395,8 +396,11 @@ class ForexManager:
     # Per-call client_id lets us detect on retry whether the first attempt's
     # order actually reached the broker — guards against duplicate positions
     # when the SDK cancels a request after the broker has already accepted it.
-    # Capped at 26 chars per MetaApi's `comment + clientId <= 26` constraint.
-    client_id = uuid.uuid4().hex[:26]
+    # MetaApi enforces a three-part `strategy_position_order` underscore
+    # format (alphanumeric segments). 23 chars, 80 bits of entropy.
+    # See https://metaapi.cloud/docs/client/clientIdUsage/
+    hex_id = uuid.uuid4().hex
+    client_id = f"sp_{hex_id[:10]}_{hex_id[10:20]}"
 
     # MetaApi SDK takes clientId/magic/slippage via the `options` dict
     # (CreateMarketTradeOptions), not as top-level kwargs.
@@ -414,6 +418,9 @@ class ForexManager:
 
     sym_lock = self._get_symbol_lock(symbol)
     async with sym_lock:
+      self.log.info(
+          "open_market_order -> MetaApi: side=%s params=%r", side, params,
+      )
       try:
         return await self._execute_market_order(side, params, symbol, volume, update_last_signal)
       except asyncio.CancelledError:
@@ -424,6 +431,14 @@ class ForexManager:
         # instead of short-circuiting on a stale ready flag.
         self.log.warning("open_market_order cancelled mid-RPC (SDK reconnect). Triggering reconnect...")
         self._ready.clear()
+      except ValidationException as e:
+        # Server rejected the payload (HTTP 400). Retrying won't help — surface
+        # the field-level details so we can fix the request, then propagate.
+        self.log.error(
+            "open_market_order rejected by MetaApi (side=%s params=%r): %s | details=%r",
+            side, params, e, e.details,
+        )
+        raise
       except Exception as e:
         self.log.warning(
             "open_market_order failed (%s). Triggering reconnect...", repr(e)

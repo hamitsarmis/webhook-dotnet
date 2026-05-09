@@ -57,10 +57,18 @@ The whole stack runs via Docker Compose. Only `webhookfx` exposes a host port (8
 ```bash
 cp signal_processor/.env.example signal_processor/.env
 # fill in METAAPI_TOKEN and METAAPI_ACCOUNT_ID
-# create root .env with ConnectionStrings__Default and RabbitMQ__Host for the .NET services
+
+# Optional: override the default postgres / rabbitmq credentials
+cp .env.example .env
+# edit .env if you want to change passwords from the published defaults
 
 docker compose up -d --build
 ```
+
+The `.NET` services read their Postgres connection string from the
+`ConnectionStrings__Default` env var, which `docker-compose.yml` builds from
+`POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD`. If `.env` is absent the
+defaults from [.env.example](.env.example) are used.
 
 See [docker-compose.yml](docker-compose.yml) for the full wiring.
 

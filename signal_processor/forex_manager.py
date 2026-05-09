@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import threading
+import uuid
 from typing import Optional, Literal, Dict, Any
 import traceback
 from datetime import datetime, timezone
@@ -11,6 +12,11 @@ from datetime import datetime, timezone
 from metaapi_cloud_sdk import MetaApi
 
 Side = Literal["buy", "sell"]
+
+# Set initial SL/TP on a freshly opened market order. Off by default — the
+# trade-manager applies trailing/breakeven on its own cycle, so the broker-side
+# stop is opt-in via env var.
+ENABLE_INITIAL_SL_TP = os.getenv("ENABLE_INITIAL_SL_TP", "").lower() in ("1", "true", "yes", "on")
 
 
 class _ConnectionWorker:
@@ -386,15 +392,25 @@ class ForexManager:
     await self._ensure_ready()
     await self._wait_for_close_all_done()
 
+    # Per-call client_id lets us detect on retry whether the first attempt's
+    # order actually reached the broker — guards against duplicate positions
+    # when the SDK cancels a request after the broker has already accepted it.
+    # Capped at 26 chars per MetaApi's `comment + clientId <= 26` constraint.
+    client_id = uuid.uuid4().hex[:26]
+
+    # MetaApi SDK takes clientId/magic/slippage via the `options` dict
+    # (CreateMarketTradeOptions), not as top-level kwargs.
+    options: Dict[str, Any] = {"clientId": client_id}
+    if magic is not None:
+        options["magic"] = magic
+    if slippage is not None:
+        options["slippage"] = slippage
+
     params = {
         "symbol": symbol,
-        "volume": volume
+        "volume": volume,
+        "options": options,
     }
-
-    if magic is not None:
-        params["magic"] = magic
-    if slippage is not None:
-        params["slippage"] = slippage
 
     sym_lock = self._get_symbol_lock(symbol)
     async with sym_lock:
@@ -404,18 +420,42 @@ class ForexManager:
         if self._current_task_is_cancelling():
           raise
         # SDK cancelled our RPC during an internal reconnect — transient.
+        # Clear _ready so _trigger_reconnect actually rebuilds the connection
+        # instead of short-circuiting on a stale ready flag.
         self.log.warning("open_market_order cancelled mid-RPC (SDK reconnect). Triggering reconnect...")
+        self._ready.clear()
       except Exception as e:
         self.log.warning(
             "open_market_order failed (%s). Triggering reconnect...", repr(e)
         )
+        self._ready.clear()
 
       await self._trigger_reconnect()
 
-      # Retry once after reconnect
+      # Did the first attempt actually reach the broker? Polling get_positions
+      # by client_id avoids placing a duplicate when the SDK cancellation
+      # happened *after* the order was accepted.
+      existing = await self._find_position_by_client_id(client_id)
+      if existing is not None:
+        self.log.warning(
+            "First attempt succeeded (position %s found via client_id=%s); skipping retry.",
+            existing.get("id"), client_id,
+        )
+        await self._finalize_market_order(existing, side, symbol, volume, update_last_signal)
+        return {"positionId": existing.get("id")}
+
+      # First attempt didn't reach the broker — safe to retry.
       try:
           self.log.warning("Retrying open_market_order after reconnect...")
           return await self._execute_market_order(side, params, symbol, volume, update_last_signal)
+      except asyncio.CancelledError:
+          if self._current_task_is_cancelling():
+            raise
+          # Inner retry was also cancelled mid-RPC. Clear _ready so any outer
+          # retry layer (listen_signals) gets a fresh reconnect on its next try.
+          self.log.error("Retry of open_market_order also cancelled mid-RPC. Giving up.")
+          self._ready.clear()
+          raise
       except Exception as retry_e:
           self.log.warning("Retry also failed (%s). Giving up.", repr(retry_e))
           raise
@@ -437,38 +477,88 @@ class ForexManager:
     # Poll for the position to appear instead of a fixed sleep.
     # MetaApi can take 50-300ms to reflect a new market order.
     position = await self._poll_for_position(position_id)
+
+    await self._finalize_market_order(position, side, symbol, volume, update_last_signal)
+    return response
+
+  async def _finalize_market_order(self, position, side, symbol, volume, update_last_signal):
+    """Set SL/TP and update last_signal/trade_state for a freshly opened position.
+
+    Safe to call twice for the same logical entry: SL/TP failure is logged
+    but does NOT prevent _trade_state from being written (so the trade-manager
+    will pick up the position and apply trailing on the next cycle), and
+    last_signal is only (re)written if it doesn't already match this entry —
+    avoiding date_created drift that would shift the deal-history window
+    consulted by _check_closed_positions_profit.
+    """
+    position_id = position["id"]
     open_price = position["openPrice"]
 
     sl_distance = self.initial_sl_distance
 
-    if update_last_signal:
+    if update_last_signal and ENABLE_INITIAL_SL_TP:
         if side == "buy":
             sl = open_price - sl_distance
             tp = open_price + 2.0
         else:
             sl = open_price + sl_distance
             tp = open_price - 2.0
-        await asyncio.wait_for(
-            self._conn.modify_position(position_id, stop_loss=sl, take_profit=tp),
-            timeout=self.rpc_timeout_sec,
-        )
-        self.log.warning(f"Set SL={sl:.2f}, TP={tp:.2f} for position {position_id} (distance={sl_distance:.1f})")
+        try:
+            await asyncio.wait_for(
+                self._conn.modify_position(position_id, stop_loss=sl, take_profit=tp),
+                timeout=self.rpc_timeout_sec,
+            )
+            self.log.warning(f"Set SL={sl:.2f}, TP={tp:.2f} for position {position_id} (distance={sl_distance:.1f})")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.log.error(
+                "CRITICAL: failed to set SL/TP on position %s (%s %s vol=%s open=%s): %s. "
+                "Position is OPEN WITHOUT PROTECTIVE STOP. Recording in trade_state "
+                "so trade-manager applies trailing on the next cycle.",
+                position_id, side, symbol, volume, open_price, repr(e),
+            )
 
     if update_last_signal:
         with self._state_lock:
-          self.last_signal = {
-              "date_created": datetime.now(timezone.utc).isoformat(),
-              "action": side,
-              "price": open_price,
-              "first_entry_price": open_price,
-              "symbol": symbol,
-              "volume": volume,
-              "has_profit": False,
-              "has_pending_order": False,
-          }
-        await self.delete_all_pending_orders()
-        self.log.warning(f"Last signal set: {self.last_signal}")
+          # Skip rewrite if last_signal already matches this entry — preserves
+          # date_created so _check_closed_positions_profit's
+          # get_deals_by_time_range window still covers the original deals.
+          already_set = (
+              self.last_signal is not None
+              and self.last_signal.get("symbol") == symbol
+              and self.last_signal.get("first_entry_price") == open_price
+              and self.last_signal.get("action") == side
+          )
+          if not already_set:
+            self.last_signal = {
+                "date_created": datetime.now(timezone.utc).isoformat(),
+                "action": side,
+                "price": open_price,
+                "first_entry_price": open_price,
+                "symbol": symbol,
+                "volume": volume,
+                "has_profit": False,
+                "has_pending_order": False,
+            }
+        if not already_set:
+          try:
+            await self.delete_all_pending_orders()
+          except asyncio.CancelledError:
+            raise
+          except Exception as e:
+            self.log.warning(
+              "delete_all_pending_orders raised in _finalize_market_order: %s", repr(e),
+            )
+          self.log.warning(f"Last signal set: {self.last_signal}")
+        else:
+          self.log.warning(
+            "last_signal already set for this entry (symbol=%s action=%s first_entry_price=%s); "
+            "skipping rewrite.", symbol, side, open_price,
+          )
 
+    # Always record trade_state so the trade-manager can manage the position,
+    # regardless of whether SL/TP set above succeeded.
     with self._state_lock:
       self._trade_state[position_id] = {
           "open_price": open_price,
@@ -483,7 +573,53 @@ class ForexManager:
         f"trail@{self.trail_activation:.1f} dist={self.trail_distance:.1f}"
     )
 
-    return response
+  async def _find_position_by_client_id(
+    self,
+    client_id: str,
+    *,
+    max_wait_sec: float = 5.0,
+    poll_interval_sec: float = 0.1,
+  ) -> Optional[Dict[str, Any]]:
+    """Poll get_positions until a position with the given clientId appears,
+    or timeout. Returns the position dict or None on a confirmed-absent result.
+
+    Raises RuntimeError if every poll attempt failed — in that case we cannot
+    distinguish "broker has no such position" from "we couldn't ask", and the
+    caller must NOT retry the order (would risk a duplicate position).
+
+    Note: MT4 brokers may strip clientId on the position; this dedupe relies
+    on the broker preserving it (MT5 generally does).
+    """
+    deadline = asyncio.get_event_loop().time() + max_wait_sec
+    ever_succeeded = False
+    last_err: Optional[BaseException] = None
+    while True:
+      try:
+        positions = await asyncio.wait_for(
+          self._conn.get_positions(),
+          timeout=self.rpc_timeout_sec,
+        )
+        ever_succeeded = True
+        for pos in (positions or []):
+          if pos.get("clientId") == client_id:
+            return pos
+      except asyncio.CancelledError:
+        raise
+      except Exception as e:
+        last_err = e
+        self.log.warning(
+          "_find_position_by_client_id poll failed for client_id=%s: %s",
+          client_id, repr(e),
+        )
+      if asyncio.get_event_loop().time() >= deadline:
+        if not ever_succeeded:
+          raise RuntimeError(
+            f"Could not verify whether order with client_id={client_id} reached "
+            f"broker after {max_wait_sec}s (last poll error: {last_err!r}). "
+            f"Refusing to retry to avoid duplicate position."
+          )
+        return None
+      await asyncio.sleep(poll_interval_sec)
 
   async def close_position_market(
     self,
@@ -514,10 +650,12 @@ class ForexManager:
       if self._current_task_is_cancelling():
         raise
       self.log.warning("close_position_market cancelled mid-RPC (SDK reconnect). Triggering reconnect...")
+      self._ready.clear()
       await self._trigger_reconnect()
       raise
     except Exception as e:
       self.log.warning("close_position_market failed (%s). Triggering reconnect...", repr(e))
+      self._ready.clear()
       await self._trigger_reconnect()
       raise
 
@@ -533,10 +671,12 @@ class ForexManager:
       if self._current_task_is_cancelling():
         raise
       self.log.warning("get_positions cancelled mid-RPC (SDK reconnect). Triggering reconnect...")
+      self._ready.clear()
       await self._trigger_reconnect()
       raise
     except Exception as e:
       self.log.warning("get_positions failed (%s). Triggering reconnect...", repr(e))
+      self._ready.clear()
       await self._trigger_reconnect()
       raise
 

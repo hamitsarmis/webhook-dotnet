@@ -29,6 +29,14 @@ public sealed class IdempotencyKeysTests
     }
 
     [Fact]
+    public void Request_hash_is_the_full_sha256_of_the_body()
+    {
+        Assert.Equal(
+            "81F0B01D703737ECB41ED3CE85716FE64B332B05BC1333DE1412E6F0E7AC41F9",
+            IdempotencyKeys.RequestHash("{\"action\":\"buy\"}"));
+    }
+
+    [Fact]
     public void Same_request_received_at_another_instant_gets_another_key()
     {
         var first = IdempotencyKeys.ForSignal("GOLD", "buy", ReceivedAt, "gold_strategy");

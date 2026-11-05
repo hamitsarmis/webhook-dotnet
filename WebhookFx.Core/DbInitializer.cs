@@ -54,6 +54,21 @@ public static class DbInitializer
                 "CreatedAt"   TIMESTAMP    NOT NULL DEFAULT NOW()
             );
 
+            -- Who asked for the signal. NULL for webhook callers on the IP whitelist,
+            -- 'mcp' for requests that came in through the internal key.
+            ALTER TABLE "Signals" ADD COLUMN IF NOT EXISTS "source" VARCHAR(20);
+
+            -- Audit trail of the MCP server's write tools. Rows are only ever inserted.
+            CREATE TABLE IF NOT EXISTS "AgentActions" (
+                "id"             BIGSERIAL    PRIMARY KEY,
+                "tool"           VARCHAR(100) NOT NULL,
+                "args"           JSONB        NOT NULL,
+                "dry_run"        BOOLEAN      NOT NULL,
+                "outcome"        TEXT         NOT NULL,
+                "correlation_id" VARCHAR(64)  NOT NULL,
+                "created_at"     TIMESTAMP    NOT NULL DEFAULT NOW()
+            );
+
             CREATE OR REPLACE FUNCTION notify_outbox_insert()
             RETURNS TRIGGER AS $$
             BEGIN

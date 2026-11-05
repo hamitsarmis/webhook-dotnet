@@ -4,7 +4,7 @@ namespace WebhookFx.Tests;
 
 public sealed record SignalRow(
     int Id, string Action, string Pair, string EntryTag, decimal OpenPrice, decimal Size,
-    DateTime? CloseTime, decimal? ClosePrice, string? IdempotencyKey);
+    DateTime? CloseTime, decimal? ClosePrice, string? IdempotencyKey, string? Source);
 
 public sealed record OutboxRow(int Id, int SignalId, string EventType, string Payload, string? IdempotencyKey);
 
@@ -16,7 +16,7 @@ public static class Db
         await using var conn = await fixture.OpenConnectionAsync();
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT "Id", "action", "pair", "entry_tag", "open_price", "size", "close_time", "close_price", "IdempotencyKey"
+            SELECT "Id", "action", "pair", "entry_tag", "open_price", "size", "close_time", "close_price", "IdempotencyKey", "source"
             FROM "Signals" ORDER BY "Id"
             """;
         var rows = new List<SignalRow>();
@@ -28,7 +28,8 @@ public static class Db
                 reader.GetDecimal(4), reader.GetDecimal(5),
                 reader.IsDBNull(6) ? null : reader.GetDateTime(6),
                 reader.IsDBNull(7) ? null : reader.GetDecimal(7),
-                reader.IsDBNull(8) ? null : reader.GetString(8)));
+                reader.IsDBNull(8) ? null : reader.GetString(8),
+                reader.IsDBNull(9) ? null : reader.GetString(9)));
         }
         return rows;
     }

@@ -20,6 +20,9 @@ public sealed class PipelineFixture : IAsyncLifetime
     public const string UnknownIp = "203.0.113.7";
     public const string RemoteIpHeader = "X-Test-Remote-Ip";
 
+    /// <summary>Generated per test run; there is no fixed key to leak.</summary>
+    public static readonly string InternalKey = Guid.NewGuid().ToString("N") + Guid.NewGuid().ToString("N");
+
     private readonly PostgreSqlContainer _postgres = new PostgreSqlBuilder("postgres:17").Build();
 
     private WebApplicationFactory<Program>? _factory;
@@ -33,6 +36,7 @@ public sealed class PipelineFixture : IAsyncLifetime
         // Program reads the connection string from configuration right after Build();
         // an environment variable is the one source that is guaranteed to be there by then.
         Environment.SetEnvironmentVariable("ConnectionStrings__Default", ConnectionString);
+        Environment.SetEnvironmentVariable("WEBHOOKFX_INTERNAL_KEY", InternalKey);
 
         _factory = new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
             builder.ConfigureServices(services =>
@@ -61,7 +65,7 @@ public sealed class PipelineFixture : IAsyncLifetime
     {
         await using var conn = await OpenConnectionAsync();
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = """TRUNCATE "OutboxEvents", "Signals", "Requests", "IdempotencyKeys" RESTART IDENTITY CASCADE""";
+        cmd.CommandText = """TRUNCATE "OutboxEvents", "Signals", "Requests", "IdempotencyKeys", "AgentActions" RESTART IDENTITY CASCADE""";
         await cmd.ExecuteNonQueryAsync();
     }
 

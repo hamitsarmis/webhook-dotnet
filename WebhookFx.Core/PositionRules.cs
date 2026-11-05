@@ -38,10 +38,17 @@ public static class PositionRules
             : OpenDecision.Reversal;
     }
 
-    /// <summary>Two actions point the same way when both contain "Long" or both contain "Short".</summary>
+    /// <summary>
+    /// Two actions point the same way when both are long ("Long" or "buy") or both are short
+    /// ("Short" or "sell"). An action that names neither never matches.
+    /// </summary>
     public static bool IsSameDirection(string existingAction, string requestedAction) =>
-        (Mentions(existingAction, "Long") && Mentions(requestedAction, "Long"))
-        || (Mentions(existingAction, "Short") && Mentions(requestedAction, "Short"));
+        (IsLong(existingAction) && IsLong(requestedAction))
+        || (IsShort(existingAction) && IsShort(requestedAction));
+
+    private static bool IsLong(string action) => Mentions(action, "Long") || Mentions(action, "buy");
+
+    private static bool IsShort(string action) => Mentions(action, "Short") || Mentions(action, "sell");
 
     private static bool MentionsClose(string text) =>
         Mentions(text, "Exit") || Mentions(text, "SL") || Mentions(text, "TP");

@@ -61,7 +61,7 @@ public sealed class PipelineFixture : IAsyncLifetime
     {
         await using var conn = await OpenConnectionAsync();
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = """TRUNCATE "OutboxEvents", "Signals", "Requests" RESTART IDENTITY CASCADE""";
+        cmd.CommandText = """TRUNCATE "OutboxEvents", "Signals", "Requests", "IdempotencyKeys" RESTART IDENTITY CASCADE""";
         await cmd.ExecuteNonQueryAsync();
     }
 

@@ -27,4 +27,8 @@ public class WebhookRequest
 
     [JsonPropertyName("lot")]
     public decimal Lot { get; set; }
+
+    /// <summary>Optional. A repeat of a request with the same key is answered from the record.</summary>
+    [JsonPropertyName("idempotency_key")]
+    public string? IdempotencyKey { get; set; }
 }

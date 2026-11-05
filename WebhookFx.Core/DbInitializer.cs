@@ -47,6 +47,13 @@ public static class DbInitializer
                 "IdempotencyKey" VARCHAR(255) UNIQUE
             );
 
+            CREATE TABLE IF NOT EXISTS "IdempotencyKeys" (
+                "Key"         VARCHAR(255) PRIMARY KEY,
+                "RequestHash" CHAR(64)     NOT NULL,
+                "Outcome"     VARCHAR(50),
+                "CreatedAt"   TIMESTAMP    NOT NULL DEFAULT NOW()
+            );
+
             CREATE OR REPLACE FUNCTION notify_outbox_insert()
             RETURNS TRIGGER AS $$
             BEGIN

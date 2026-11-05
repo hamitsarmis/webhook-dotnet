@@ -73,9 +73,28 @@ app.MapPost("/webhookfx", async (HttpContext context) =>
         return Results.BadRequest("Empty request body.");
     }
 
-    var outcome = await signals.HandleAsync(request, rawBody);
+    // The header wins over the body field; without either the request is handled as before.
+    var keyHeader = context.Request.Headers["Idempotency-Key"].ToString();
+    var idempotencyKey = !string.IsNullOrWhiteSpace(keyHeader) ? keyHeader.Trim()
+        : !string.IsNullOrWhiteSpace(request.IdempotencyKey) ? request.IdempotencyKey.Trim()
+        : null;
 
-    _ = LogRequestAsync(connectionString, rawBody, isValid: outcome != SignalOutcome.NothingToClose, logger);
+    if (idempotencyKey is { Length: > 255 })
+    {
+        _ = LogRequestAsync(connectionString, rawBody, isValid: false, logger);
+        return Results.BadRequest("Idempotency key is longer than 255 characters.");
+    }
+
+    var result = await signals.HandleAsync(request, rawBody, idempotencyKey);
+    var outcome = result.Outcome;
+
+    if (result.Replayed)
+        context.Response.Headers["Idempotent-Replayed"] = "true";
+
+    _ = LogRequestAsync(
+        connectionString, rawBody,
+        isValid: outcome is not (SignalOutcome.NothingToClose or SignalOutcome.IdempotencyKeyConflict),
+        logger);
 
     return outcome switch
     {
@@ -84,6 +103,8 @@ app.MapPost("/webhookfx", async (HttpContext context) =>
         SignalOutcome.AlreadyOpen => Results.Ok("Position already open in the same direction."),
         SignalOutcome.Closed => Results.Ok("Position closed."),
         SignalOutcome.NothingToClose => Results.NotFound("No open position found for this pair."),
+        SignalOutcome.IdempotencyKeyConflict =>
+            Results.UnprocessableEntity("Idempotency key was already used for a different request."),
         _ => throw new InvalidOperationException($"Unhandled outcome {outcome}."),
     };
 });

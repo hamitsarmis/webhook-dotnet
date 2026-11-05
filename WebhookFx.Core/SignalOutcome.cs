@@ -17,4 +17,11 @@ public enum SignalOutcome
 
     /// <summary>A close was requested but the pair had no open position; nothing was written.</summary>
     NothingToClose,
+
+    /// <summary>The idempotency key was already used for a different request; nothing was written.</summary>
+    IdempotencyKeyConflict,
 }
+
+/// <param name="Outcome">What the request did, or did the first time it was seen.</param>
+/// <param name="Replayed">True when the answer comes from the idempotency record and nothing was done now.</param>
+public sealed record SignalResult(SignalOutcome Outcome, bool Replayed = false);

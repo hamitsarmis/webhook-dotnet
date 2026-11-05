@@ -30,6 +30,9 @@ var app = builder.Build();
 
 var connectionString = builder.Configuration.GetConnectionString("Default")!;
 
+// Fail before touching the database when the internal key is set but unusable.
+InternalKey.Validate(builder.Configuration[InternalKey.ConfigurationName]);
+
 await DbInitializer.InitializeAsync(connectionString);
 
 var signals = new SignalService(connectionString);

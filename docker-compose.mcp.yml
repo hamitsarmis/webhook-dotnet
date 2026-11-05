@@ -1,0 +1,10 @@
+# Optional override for running the MCP server on the host:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.mcp.yml up -d --build
+#
+# It publishes Postgres on the loopback interface only, so `dotnet run --project WebhookFx.Mcp`
+# can read the pipeline's tables and write its audit rows. Nothing else changes.
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${MCP_POSTGRES_PORT:-5432}:5432"

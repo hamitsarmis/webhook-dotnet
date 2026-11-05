@@ -5,6 +5,8 @@
     <Platform Name="x86" />
   </Configurations>
   <Project Path="OutboxProcessor/OutboxProcessor.csproj" />
+  <Project Path="WebhookFx.Core.Tests/WebhookFx.Core.Tests.csproj" />
+  <Project Path="WebhookFx.Core/WebhookFx.Core.csproj" />
   <Project Path="WebhookFx.Tests/WebhookFx.Tests.csproj" />
   <Project Path="WebhookFx/WebhookFx.csproj" />
 </Solution>

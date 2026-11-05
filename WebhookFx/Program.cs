@@ -1,12 +1,9 @@
-using System.Security.Cryptography;
-using System.Text;
 using NLog;
 using NLog.Config;
 using NLog.Targets;
 using Npgsql;
-using WebhookFx.Database;
+using WebhookFx.Core;
 using WebhookFx.Middleware;
-using WebhookFx.Models;
 
 var nlogConfig = new LoggingConfiguration();
 var fileTarget = new FileTarget("logfile")
@@ -34,6 +31,8 @@ var app = builder.Build();
 var connectionString = builder.Configuration.GetConnectionString("Default")!;
 
 await DbInitializer.InitializeAsync(connectionString);
+
+var signals = new SignalService(connectionString);
 
 var accessLogger = LogManager.GetLogger("AccessLog");
 app.Use(async (context, next) =>
@@ -74,173 +73,19 @@ app.MapPost("/webhookfx", async (HttpContext context) =>
         return Results.BadRequest("Empty request body.");
     }
 
-    bool isCloseRequest = request.AlertMessage.Contains("Exit", StringComparison.OrdinalIgnoreCase)
-                       || request.AlertMessage.Contains("SL", StringComparison.OrdinalIgnoreCase)
-                       || request.AlertMessage.Contains("TP", StringComparison.OrdinalIgnoreCase)
-                       || request.Comment.Contains("Exit", StringComparison.OrdinalIgnoreCase)
-                       || request.Comment.Contains("SL", StringComparison.OrdinalIgnoreCase)
-                       || request.Comment.Contains("TP", StringComparison.OrdinalIgnoreCase);
+    var outcome = await signals.HandleAsync(request, rawBody);
 
-    await using var conn = new NpgsqlConnection(connectionString);
-    await conn.OpenAsync();
+    _ = LogRequestAsync(connectionString, rawBody, isValid: outcome != SignalOutcome.NothingToClose, logger);
 
-    var openTime = DateTime.UtcNow;
-    var raw = $"{request.Pair}_{request.Action}_{openTime:O}_{request.EntryTag}";
-    var idempotencyKey = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(raw)))[..32];
-
-    await using var tx = await conn.BeginTransactionAsync();
-
-    if (!isCloseRequest)
+    return outcome switch
     {
-        // Check for existing open position on this pair
-        await using var checkCmd = conn.CreateCommand();
-        checkCmd.Transaction = tx;
-        checkCmd.CommandText = """
-            SELECT "Id", "action" FROM "Signals"
-            WHERE "pair" = @pair AND "close_time" IS NULL
-            ORDER BY "open_time" DESC
-            LIMIT 1
-            """;
-        checkCmd.Parameters.AddWithValue("pair", request.Pair);
-
-        int? existingId = null;
-        string? existingAction = null;
-        await using (var rdr = await checkCmd.ExecuteReaderAsync())
-        {
-            if (await rdr.ReadAsync())
-            {
-                existingId = rdr.GetInt32(0);
-                existingAction = rdr.GetString(1);
-            }
-        }
-
-        if (existingId is not null)
-        {
-            bool sameDirection =
-                (existingAction!.Contains("Long", StringComparison.OrdinalIgnoreCase)
-                 && request.Action.Contains("Long", StringComparison.OrdinalIgnoreCase))
-                || (existingAction.Contains("Short", StringComparison.OrdinalIgnoreCase)
-                    && request.Action.Contains("Short", StringComparison.OrdinalIgnoreCase));
-
-            if (sameDirection)
-            {
-                await tx.RollbackAsync();
-                _ = LogRequestAsync(connectionString, rawBody, isValid: true, logger);
-                return Results.Ok("Position already open in the same direction.");
-            }
-
-            // Opposite direction: close existing position first
-            await using var closeCmd = conn.CreateCommand();
-            closeCmd.Transaction = tx;
-            closeCmd.CommandText = """
-                UPDATE "Signals"
-                SET "close_time" = @close_time, "close_price" = @close_price
-                WHERE "Id" = @id
-                RETURNING "Id"
-                """;
-            closeCmd.Parameters.AddWithValue("close_time", DateTime.UtcNow);
-            closeCmd.Parameters.AddWithValue("close_price", request.Price);
-            closeCmd.Parameters.AddWithValue("id", existingId.Value);
-            var closedId = (int)(await closeCmd.ExecuteScalarAsync())!;
-
-            var closeIdempotencyKey = Convert.ToHexString(
-                SHA256.HashData(Encoding.UTF8.GetBytes($"reversal_close_{closedId}_{openTime:O}")))[..32];
-
-            await using var closeOutboxCmd = conn.CreateCommand();
-            closeOutboxCmd.Transaction = tx;
-            closeOutboxCmd.CommandText = """
-                INSERT INTO "OutboxEvents" ("SignalId", "EventType", "Payload", "IdempotencyKey")
-                VALUES (@signal_id, 'signal.closed', @payload::jsonb, @idempotency_key)
-                """;
-            closeOutboxCmd.Parameters.AddWithValue("signal_id", closedId);
-            closeOutboxCmd.Parameters.AddWithValue("payload", rawBody);
-            closeOutboxCmd.Parameters.AddWithValue("idempotency_key", closeIdempotencyKey);
-            await closeOutboxCmd.ExecuteNonQueryAsync();
-        }
-
-        // Open the new position
-        await using var cmd = conn.CreateCommand();
-        cmd.Transaction = tx;
-        cmd.CommandText = """
-            INSERT INTO "Signals" ("open_time", "action", "pair", "entry_tag", "alert_message", "comment", "open_price", "allow_multiple", "size", "IdempotencyKey")
-            VALUES (@open_time, @action, @pair, @entry_tag, @alert_message, @comment, @open_price, @allow_multiple, @size, @idempotency_key)
-            ON CONFLICT ("IdempotencyKey") DO NOTHING
-            RETURNING "Id"
-            """;
-        cmd.Parameters.AddWithValue("open_time", openTime);
-        cmd.Parameters.AddWithValue("action", request.Action);
-        cmd.Parameters.AddWithValue("pair", request.Pair);
-        cmd.Parameters.AddWithValue("entry_tag", request.EntryTag);
-        cmd.Parameters.AddWithValue("alert_message", request.AlertMessage);
-        cmd.Parameters.AddWithValue("comment", request.Comment);
-        cmd.Parameters.AddWithValue("open_price", request.Price);
-        cmd.Parameters.AddWithValue("allow_multiple", request.AllowMultiple);
-        cmd.Parameters.AddWithValue("size", request.Lot);
-        cmd.Parameters.AddWithValue("idempotency_key", idempotencyKey);
-
-        var result = await cmd.ExecuteScalarAsync();
-        if (result is int signalId)
-        {
-            await using var outboxCmd = conn.CreateCommand();
-            outboxCmd.Transaction = tx;
-            outboxCmd.CommandText = """
-                INSERT INTO "OutboxEvents" ("SignalId", "EventType", "Payload", "IdempotencyKey")
-                VALUES (@signal_id, 'signal.created', @payload::jsonb, @idempotency_key)
-                """;
-            outboxCmd.Parameters.AddWithValue("signal_id", signalId);
-            outboxCmd.Parameters.AddWithValue("payload", rawBody);
-            outboxCmd.Parameters.AddWithValue("idempotency_key", idempotencyKey);
-            await outboxCmd.ExecuteNonQueryAsync();
-        }
-
-        await tx.CommitAsync();
-        _ = LogRequestAsync(connectionString, rawBody, isValid: true, logger);
-        return existingId is not null
-            ? Results.Ok("Position reversed.")
-            : Results.Ok("Position opened.");
-    }
-    else
-    {
-        await using var cmd = conn.CreateCommand();
-        cmd.Transaction = tx;
-        cmd.CommandText = """
-            UPDATE "Signals"
-            SET "close_time" = @close_time, "close_price" = @close_price
-            WHERE "Id" = (
-                SELECT "Id" FROM "Signals"
-                WHERE "pair" = @pair AND "close_time" IS NULL
-                ORDER BY "open_time" ASC
-                LIMIT 1
-            )
-            RETURNING "Id"
-            """;
-        cmd.Parameters.AddWithValue("close_time", DateTime.UtcNow);
-        cmd.Parameters.AddWithValue("close_price", request.Price);
-        cmd.Parameters.AddWithValue("pair", request.Pair);
-
-        var result = await cmd.ExecuteScalarAsync();
-        if (result is not int signalId)
-        {
-            await tx.RollbackAsync();
-            _ = LogRequestAsync(connectionString, rawBody, isValid: false, logger);
-            return Results.NotFound("No open position found for this pair.");
-        }
-
-        await using var outboxCmd = conn.CreateCommand();
-        outboxCmd.Transaction = tx;
-        outboxCmd.CommandText = """
-            INSERT INTO "OutboxEvents" ("SignalId", "EventType", "Payload", "IdempotencyKey")
-            VALUES (@signal_id, 'signal.closed', @payload::jsonb, @idempotency_key)
-            """;
-        outboxCmd.Parameters.AddWithValue("signal_id", signalId);
-        outboxCmd.Parameters.AddWithValue("payload", rawBody);
-        outboxCmd.Parameters.AddWithValue("idempotency_key", idempotencyKey);
-        await outboxCmd.ExecuteNonQueryAsync();
-
-        await tx.CommitAsync();
-        _ = LogRequestAsync(connectionString, rawBody, isValid: true, logger);
-        return Results.Ok("Position closed.");
-    }
+        SignalOutcome.Opened => Results.Ok("Position opened."),
+        SignalOutcome.Reversed => Results.Ok("Position reversed."),
+        SignalOutcome.AlreadyOpen => Results.Ok("Position already open in the same direction."),
+        SignalOutcome.Closed => Results.Ok("Position closed."),
+        SignalOutcome.NothingToClose => Results.NotFound("No open position found for this pair."),
+        _ => throw new InvalidOperationException($"Unhandled outcome {outcome}."),
+    };
 });
 
 static async Task LogRequestAsync(string connectionString, string rawJson, bool isValid, NLog.Logger log)

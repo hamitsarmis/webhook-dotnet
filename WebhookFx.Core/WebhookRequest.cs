@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 
-namespace WebhookFx.Models;
+namespace WebhookFx.Core;
 
 public class WebhookRequest
 {

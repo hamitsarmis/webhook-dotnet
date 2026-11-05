@@ -1,6 +1,6 @@
 using Npgsql;
 
-namespace WebhookFx.Database;
+namespace WebhookFx.Core;
 
 public static class DbInitializer
 {

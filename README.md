@@ -45,7 +45,7 @@ Webhook body posted to `POST /webhookfx`:
 
 A request is treated as a close when `alert_message` or `comment` contains `Exit`, `SL`, or `TP`. See [open_position_request.json](open_position_request.json) and [close_position_request.json](close_position_request.json) for examples.
 
-Position rules in [WebhookFx/Program.cs](WebhookFx/Program.cs):
+Position rules in [WebhookFx.Core/PositionRules.cs](WebhookFx.Core/PositionRules.cs):
 - Same pair, same direction already open → no-op.
 - Same pair, opposite direction → close existing, open new (reversal).
 - Close request with no open position → 404.

@@ -115,10 +115,12 @@ public sealed class WebhookEndpointTests : IAsyncLifetime
     // ---- same direction -----------------------------------------------------------------
 
     [Theory]
+    [InlineData("buy", "buy")]
+    [InlineData("sell", "sell")]
     [InlineData("Enter Long", "long")]
     [InlineData("Short", "enter short")]
-    public async Task Second_open_in_the_same_direction_is_a_no_op_when_the_action_says_long_or_short(
-        string firstAction, string secondAction)
+    [InlineData("Long", "buy")]
+    public async Task Second_open_in_the_same_direction_is_a_no_op(string firstAction, string secondAction)
     {
         await _tradingView.PostAsync("/webhookfx", Json(Open(firstAction)));
 
@@ -129,28 +131,6 @@ public sealed class WebhookEndpointTests : IAsyncLifetime
         var signal = Assert.Single(await _fixture.SignalsAsync());
         Assert.Null(signal.CloseTime);
         Assert.Single(await _fixture.OutboxAsync());
-    }
-
-    /// <summary>
-    /// Pins what the endpoint does today, not what the README promises: the direction check
-    /// looks for the words "Long" and "Short", so two "buy" requests are not recognised as
-    /// the same direction and the open position is closed and reopened.
-    /// </summary>
-    [Theory]
-    [InlineData("buy", "buy")]
-    [InlineData("sell", "sell")]
-    public async Task Second_open_with_the_same_buy_or_sell_action_closes_and_reopens_the_position(
-        string firstAction, string secondAction)
-    {
-        await _tradingView.PostAsync("/webhookfx", Json(Open(firstAction, price: 100m)));
-
-        var response = await _tradingView.PostAsync("/webhookfx", Json(Open(secondAction, price: 101m)));
-
-        Assert.Equal("Position reversed.", await Text(response));
-        var signals = await _fixture.SignalsAsync();
-        Assert.Equal(2, signals.Count);
-        Assert.NotNull(signals[0].CloseTime);
-        Assert.Null(signals[1].CloseTime);
     }
 
     // ---- reversal -----------------------------------------------------------------------

@@ -1,8 +1,8 @@
 namespace WebhookFx.Core.Tests;
 
 /// <summary>
-/// Parity tests: each case states what the inline code in WebhookFx/Program.cs did before the
-/// rules were moved here. Some of it is surprising; it is pinned as found, not as intended.
+/// Case-by-case tests of the rules. The close-detection cases still state what the inline code
+/// in WebhookFx/Program.cs did before the rules were moved here, surprising or not.
 /// </summary>
 public sealed class PositionRulesTests
 {
@@ -68,8 +68,11 @@ public sealed class PositionRulesTests
     [InlineData("LONG", "go long now")]
     [InlineData("Short", "short")]
     [InlineData("enter short", "SHORT")]
-    public void Same_direction_is_a_no_op_when_both_actions_say_long_or_both_say_short(
-        string existingAction, string requestedAction)
+    [InlineData("buy", "buy")]
+    [InlineData("BUY", "buy")]
+    [InlineData("sell", "sell")]
+    [InlineData("sell", "SELL")]
+    public void Same_direction_is_a_no_op(string existingAction, string requestedAction)
     {
         Assert.Equal(OpenDecision.NoOp, PositionRules.DecideOpen(existingAction, requestedAction));
     }
@@ -84,26 +87,32 @@ public sealed class PositionRulesTests
         Assert.Equal(OpenDecision.Reversal, PositionRules.DecideOpen(existingAction, requestedAction));
     }
 
-    /// <summary>
-    /// The direction check only knows the words "Long" and "Short". The payloads this pipeline
-    /// actually receives say "buy" and "sell", so a repeated "buy" is not seen as the same
-    /// direction and becomes a reversal: the position is closed and reopened.
-    /// </summary>
+    /// <summary>"buy" and "Long" are the same direction, and so are "sell" and "Short".</summary>
     [Theory]
-    [InlineData("buy", "buy")]
-    [InlineData("sell", "sell")]
-    [InlineData("BUY", "buy")]
-    public void Repeated_buy_or_sell_is_not_recognised_as_same_direction_and_becomes_a_reversal(
-        string existingAction, string requestedAction)
+    [InlineData("Long", "buy")]
+    [InlineData("buy", "Enter Long")]
+    [InlineData("Short", "sell")]
+    [InlineData("sell", "short")]
+    public void Buy_means_long_and_sell_means_short(string existingAction, string requestedAction)
+    {
+        Assert.Equal(OpenDecision.NoOp, PositionRules.DecideOpen(existingAction, requestedAction));
+    }
+
+    [Theory]
+    [InlineData("Long", "sell")]
+    [InlineData("buy", "Short")]
+    public void Mixed_vocabulary_in_opposite_directions_is_a_reversal(string existingAction, string requestedAction)
     {
         Assert.Equal(OpenDecision.Reversal, PositionRules.DecideOpen(existingAction, requestedAction));
     }
 
+    /// <summary>An action that names no direction never matches the open position, so it reverses it.</summary>
     [Theory]
-    [InlineData("Long", "buy")]
-    [InlineData("buy", "Long")]
     [InlineData("hold", "hold")]
-    public void Anything_else_against_an_open_position_is_a_reversal(string existingAction, string requestedAction)
+    [InlineData("buy", "")]
+    [InlineData("", "sell")]
+    public void Action_without_a_direction_against_an_open_position_is_a_reversal(
+        string existingAction, string requestedAction)
     {
         Assert.Equal(OpenDecision.Reversal, PositionRules.DecideOpen(existingAction, requestedAction));
     }

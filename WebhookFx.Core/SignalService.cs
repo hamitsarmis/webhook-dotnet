@@ -22,7 +22,9 @@ public sealed class SignalService
     /// outcome recorded in the same transaction. Any later request with that key gets the
     /// recorded outcome and changes nothing, unless its body differs, which is a conflict.
     /// </param>
-    public async Task<SignalResult> HandleAsync(WebhookRequest request, string rawBody, string? idempotencyKey = null)
+    /// <param name="source">Stored on a newly opened signal; null for ordinary webhook callers.</param>
+    public async Task<SignalResult> HandleAsync(
+        WebhookRequest request, string rawBody, string? idempotencyKey = null, string? source = null)
     {
         bool isCloseRequest = PositionRules.IsCloseRequest(request);
 
@@ -46,7 +48,7 @@ public sealed class SignalService
 
         var outcome = isCloseRequest
             ? await CloseAsync(conn, tx, request, rawBody, rowKey)
-            : await OpenAsync(conn, tx, request, rawBody, receivedAt, rowKey);
+            : await OpenAsync(conn, tx, request, rawBody, receivedAt, rowKey, source);
 
         if (idempotencyKey is not null)
         {
@@ -111,7 +113,7 @@ public sealed class SignalService
 
     private static async Task<SignalOutcome> OpenAsync(
         NpgsqlConnection conn, NpgsqlTransaction tx, WebhookRequest request, string rawBody,
-        DateTime receivedAt, string rowKey)
+        DateTime receivedAt, string rowKey, string? source)
     {
         var existing = await PositionQueries.FindLatestOpenAsync(conn, tx, request.Pair);
         var decision = PositionRules.DecideOpen(existing?.Action, request.Action);
@@ -143,8 +145,8 @@ public sealed class SignalService
         await using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
         cmd.CommandText = """
-            INSERT INTO "Signals" ("open_time", "action", "pair", "entry_tag", "alert_message", "comment", "open_price", "allow_multiple", "size", "IdempotencyKey")
-            VALUES (@open_time, @action, @pair, @entry_tag, @alert_message, @comment, @open_price, @allow_multiple, @size, @idempotency_key)
+            INSERT INTO "Signals" ("open_time", "action", "pair", "entry_tag", "alert_message", "comment", "open_price", "allow_multiple", "size", "IdempotencyKey", "source")
+            VALUES (@open_time, @action, @pair, @entry_tag, @alert_message, @comment, @open_price, @allow_multiple, @size, @idempotency_key, @source)
             ON CONFLICT ("IdempotencyKey") DO NOTHING
             RETURNING "Id"
             """;
@@ -158,6 +160,7 @@ public sealed class SignalService
         cmd.Parameters.AddWithValue("allow_multiple", request.AllowMultiple);
         cmd.Parameters.AddWithValue("size", request.Lot);
         cmd.Parameters.AddWithValue("idempotency_key", rowKey);
+        cmd.Parameters.AddWithValue("source", (object?)source ?? DBNull.Value);
 
         var result = await cmd.ExecuteScalarAsync();
         if (result is int signalId)

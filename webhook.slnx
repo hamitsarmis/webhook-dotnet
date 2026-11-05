@@ -7,6 +7,8 @@
   <Project Path="OutboxProcessor/OutboxProcessor.csproj" />
   <Project Path="WebhookFx.Core.Tests/WebhookFx.Core.Tests.csproj" />
   <Project Path="WebhookFx.Core/WebhookFx.Core.csproj" />
+  <Project Path="WebhookFx.Mcp.Tests/WebhookFx.Mcp.Tests.csproj" />
+  <Project Path="WebhookFx.Mcp/WebhookFx.Mcp.csproj" />
   <Project Path="WebhookFx.Tests/WebhookFx.Tests.csproj" />
   <Project Path="WebhookFx/WebhookFx.csproj" />
 </Solution>

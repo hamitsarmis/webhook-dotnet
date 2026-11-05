@@ -9,6 +9,9 @@ services:
       - ./logs:/app/logs
     environment:
       ConnectionStrings__Default: "Host=postgres;Database=${POSTGRES_DB:-webhookfx};Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD:-postgres}"
+      # Empty (the default) keeps the internal path closed: only whitelisted IPs can post.
+      # Set it in .env to let the MCP server reach the endpoint. See docs/mcp.md.
+      WEBHOOKFX_INTERNAL_KEY: ${WEBHOOKFX_INTERNAL_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy

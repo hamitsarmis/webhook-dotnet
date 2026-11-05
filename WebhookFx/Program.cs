@@ -30,6 +30,9 @@ var app = builder.Build();
 
 var connectionString = builder.Configuration.GetConnectionString("Default")!;
 
+// Fail before touching the database when the internal key is set but unusable.
+InternalKey.Validate(builder.Configuration[InternalKey.ConfigurationName]);
+
 await DbInitializer.InitializeAsync(connectionString);
 
 var signals = new SignalService(connectionString);
@@ -85,7 +88,9 @@ app.MapPost("/webhookfx", async (HttpContext context) =>
         return Results.BadRequest("Idempotency key is longer than 255 characters.");
     }
 
-    var result = await signals.HandleAsync(request, rawBody, idempotencyKey);
+    var source = context.Items.ContainsKey(IpWhitelistMiddleware.InternalCallerItem) ? "mcp" : null;
+
+    var result = await signals.HandleAsync(request, rawBody, idempotencyKey, source);
     var outcome = result.Outcome;
 
     if (result.Replayed)

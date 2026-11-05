@@ -126,8 +126,8 @@ A session in the default configuration:
 
 Security model, in the order a write passes through it:
 
-1. **Two switches.** `MCP_DRY_RUN` defaults to `true`: write tools validate, log and audit, and make no HTTP call. Turning it off is not enough; `MCP_ALLOW_LIVE` must also be `true`, otherwise the write is refused. Only the exact words `false` and `true` flip them.
-2. **Confirmation token.** HMAC-SHA256 over the arguments and the position state the preview saw. Valid 60 seconds, once. Different arguments, a changed position, a second use or a restart of the server all invalidate it.
+1. **Two switches.** `MCP_DRY_RUN` defaults to `true`: write tools validate, log and audit, and make no HTTP call. Turning it off is not enough; `MCP_ALLOW_LIVE` must also be `true`, otherwise the write is refused. Only the words `false` and `true` flip them (in any casing); any other value, a typo included, keeps the safe setting.
+2. **Confirmation token.** HMAC-SHA256 over the arguments and the position state the preview saw. Valid 60 seconds, once. It is refused for other arguments, after the position has changed, on a second use and after a restart of the server.
 3. **Lot cap.** `MCP_MAX_LOT`, default `0.1`.
 4. **Audit row first.** Every write call inserts into `AgentActions`, refusals and dry runs included. A live order is sent only after its `submitted` row is stored.
 5. **Internal key.** The server posts to `/webhookfx` with `X-Internal-Key`. The API compares it in constant time against `WEBHOOKFX_INTERNAL_KEY`; a valid key admits that one request, the IP whitelist is unchanged, and the signal is stored with `source = 'mcp'`. The token's nonce is sent as the `Idempotency-Key`, so one token cannot produce two orders.
@@ -159,7 +159,7 @@ Allowed TradingView addresses are hard-coded in [WebhookFx/Middleware/IpWhitelis
 
 - **Outbox instead of publishing from the request.** The signal and its event are committed together, so a crash between "stored" and "published" loses nothing. Trade-off: one more service, and delivery to RabbitMQ is at-least-once.
 - **`LISTEN/NOTIFY` with a polling fallback.** An insert trigger notifies the processor, so there is no polling delay in the normal case; the 30-second poll covers a missed notification. Trade-off: a dedicated database connection that must stay open.
-- **Agent writes go through the webhook endpoint.** The MCP server has no write access to `Signals`. Rules, idempotency and outbox exist once. Trade-off: the API must be up, and the agent's orders carry price 0 because the server has no price feed.
+- **Agent writes go through the webhook endpoint.** The MCP server's code never writes to `Signals`, and with the database role in [docs/mcp.md](docs/mcp.md) it cannot. Rules, idempotency and outbox exist once. Trade-off: the API must be up, and the agent's orders carry price 0 because the server has no price feed.
 - **Preview, then confirm.** A token ties the write to what the user saw, including the state of the position. Trade-off: two calls per write, and a token is lost if the server restarts.
 - **Idempotency keys come from the caller.** Only the caller knows that two deliveries are the same request. Trade-off: a caller that sends no key gets no protection.
 - **Raw Npgsql, no ORM.** A handful of statements, each visible where it runs. Trade-off: schema changes are hand-written `IF NOT EXISTS` statements, with no migration history.

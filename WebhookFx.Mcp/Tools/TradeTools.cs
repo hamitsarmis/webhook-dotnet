@@ -226,11 +226,13 @@ public sealed class TradeTools
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or InvalidOperationException)
         {
-            _logger.LogError(ex, "LIVE {Tool} could not reach the webhook.", tool);
-            await TryAuditAsync(tool, argumentsJson, $"failed: {ex.Message}", correlationId, CancellationToken.None);
+            // No answer is not a "no". A timeout can hit after the API has stored the order, so
+            // this is recorded as unknown; the idempotency key tells later whether it arrived.
+            _logger.LogError(ex, "LIVE {Tool} got no answer from the webhook.", tool);
+            await TryAuditAsync(tool, argumentsJson, $"unknown: {ex.Message}", correlationId, CancellationToken.None);
             return new TradeResult(
-                "failed", DryRun: false,
-                $"The webhook could not be reached: {ex.Message} It is unknown whether the request arrived; check list_open_positions.",
+                "unknown", DryRun: false,
+                $"No answer from the pipeline: {ex.Message} The request may or may not have arrived; check list_open_positions before doing anything else.",
                 HttpStatus: null, Response: null, correlationId);
         }
 

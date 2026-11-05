@@ -309,19 +309,26 @@ public sealed class TradeToolsTests
         Assert.StartsWith("failed: 403", h.Audit.Entries.Last().Outcome);
     }
 
-    [Fact]
-    public async Task Unreachable_webhook_is_reported_and_audited_as_failed()
+    /// <summary>
+    /// No answer is not a "no": a timeout can hit after the API has already stored the order.
+    /// The result and the audit row must say that the outcome is unknown, not that it failed.
+    /// </summary>
+    [Theory]
+    [InlineData(false, "Connection refused")]
+    [InlineData(true, "The request was canceled due to the configured HttpClient.Timeout of 15 seconds elapsing.")]
+    public async Task Request_that_gets_no_answer_is_reported_and_audited_as_unknown(bool timeout, string message)
     {
         var h = new Harness(Harness.Live);
-        h.Webhook.Failure = new HttpRequestException("Connection refused");
+        h.Webhook.Failure = timeout ? new TaskCanceledException(message) : new HttpRequestException(message);
         var token = await h.PreviewTokenAsync();
 
         var result = await h.Trade.OpenPosition("GOLD", "buy", 0.01m, "manual", token);
 
-        Assert.Equal("failed", result.Status);
+        Assert.Equal("unknown", result.Status);
         Assert.Null(result.HttpStatus);
-        Assert.Contains("Connection refused", result.Detail);
-        Assert.Equal(new[] { "submitted", "failed: Connection refused" }, h.Audit.Entries.Select(e => e.Outcome));
+        Assert.Contains(message, result.Detail);
+        Assert.Contains("list_open_positions", result.Detail);
+        Assert.Equal(new[] { "submitted", $"unknown: {message}" }, h.Audit.Entries.Select(e => e.Outcome));
     }
 
     // ---- close --------------------------------------------------------------------------

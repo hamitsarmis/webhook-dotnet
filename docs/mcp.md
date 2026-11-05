@@ -36,13 +36,13 @@ What happens when one is missing:
 
 | `MCP_DRY_RUN` | `MCP_ALLOW_LIVE` | key | A confirmed write |
 |---|---|---|---|
-| unset or anything but `false` | any | any | dry run, no HTTP call |
-| `false` | unset or anything but `true` | any | refused |
+| unset, or any value other than the word `false` | any | any | dry run, no HTTP call |
+| `false` | unset, or any value other than the word `true` | any | refused |
 | `false` | `true` | unset | refused |
 | `false` | `true` | set, wrong | sent, API answers 403, reported as `failed` |
 | `false` | `true` | set, right | sent |
 
-`get_health` and every preview report the current mode (`dry_run`, `live_allowed`).
+The two words are matched without regard to casing or surrounding spaces; `MCP_DRY_RUN=flase` is a dry run. `get_health` and every preview report the current mode (`dry_run`, `live_allowed`).
 
 ## The path of a write
 
@@ -56,7 +56,7 @@ open_position(pair, action, lot, entry_tag, confirmation_token)
    ├─ redeem the token            signature covers arguments + decision + position id
    │
    ├─ dry run:  audit "dry_run"   -> answer, nothing sent
-   └─ live:     audit "submitted" -> POST /webhookfx -> audit "executed: ..." or "failed: ..."
+   └─ live:     audit "submitted" -> POST /webhookfx -> audit "executed: ...", "failed: ..." or "unknown: ..."
 ```
 
 Every "no" on the way down ends in an audit row `refused: <reason>` and an answer with `"status": "refused"`. If the audit row cannot be written, nothing is sent.
@@ -124,7 +124,8 @@ With that role every tool works, and the server cannot change a signal, cannot e
 | `refused: <reason>` | stopped before sending |
 | `submitted` | about to be sent; written before the HTTP call |
 | `executed: <status> <text>` | the API accepted it |
-| `failed: <status or error>` | the API rejected it, or could not be reached |
+| `failed: <status> <text>` | the API answered and said no; nothing was changed |
+| `unknown: <error>` | the API did not answer (connection error, or the 15-second timeout); the order may or may not have been stored |
 
 `args` holds the tool's arguments without the token. A live write has two rows with the same `correlation_id`, and that ID is the idempotency key the API stored:
 
@@ -133,12 +134,14 @@ With that role every tool works, and the server cannot change a signal, cannot e
 SELECT created_at, tool, dry_run, outcome, args FROM "AgentActions"
 WHERE created_at >= CURRENT_DATE ORDER BY id;
 
--- a submitted order with no result row (server died mid-call): did it arrive?
-SELECT a.correlation_id, k."Outcome"
+-- submitted orders with no definite answer (timeout, or the server died mid-call): did they arrive?
+-- "Outcome" is NULL when the API never stored the request, otherwise what it did with it.
+SELECT a.correlation_id, a.tool, a.created_at, k."Outcome"
 FROM "AgentActions" a LEFT JOIN "IdempotencyKeys" k ON k."Key" = a.correlation_id
 WHERE a.outcome = 'submitted'
   AND NOT EXISTS (SELECT 1 FROM "AgentActions" r
-                  WHERE r.correlation_id = a.correlation_id AND r.outcome <> 'submitted');
+                  WHERE r.correlation_id = a.correlation_id
+                    AND (r.outcome LIKE 'executed:%' OR r.outcome LIKE 'failed:%'));
 
 -- signals opened by the agent
 SELECT "Id", pair, action, size, open_time, close_time FROM "Signals" WHERE source = 'mcp';
@@ -150,5 +153,5 @@ SELECT "Id", pair, action, size, open_time, close_time FROM "Signals" WHERE sour
 - `action` is limited to `buy` and `sell`, the two values the Python worker passes to the broker.
 - The server has no price feed. Its requests carry `price: 0`, so `open_price` and `close_price` of agent-made changes are 0. Orders fill at market.
 - The position is re-read just before the request is sent, not locked. A TradingView signal arriving in that gap is not detected by the token; the API's own rules still apply to both requests.
-- Refusals are returned as a normal tool result with `"status": "refused"`, not as an MCP error.
+- Refusals, failures and unknown outcomes are returned as a normal tool result with a `status` field, not as an MCP error.
 - `close_position` closes what the API's close rule closes: the oldest open signal of the pair, and the worker then closes every position on that symbol.

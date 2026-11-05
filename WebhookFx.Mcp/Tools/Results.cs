@@ -49,7 +49,7 @@ public sealed record PreviewResult(
     [property: JsonPropertyName("dry_run")] bool DryRun,
     [property: JsonPropertyName("live_allowed")] bool LiveAllowed);
 
-/// <param name="Status">"dry_run", "executed", "refused" or "failed".</param>
+/// <param name="Status">"dry_run", "executed", "refused", "failed" (nothing changed: the API said no, or the audit log was unavailable) or "unknown" (the API did not answer).</param>
 /// <param name="DryRun">True when the server was in dry-run mode, in which case no request was sent.</param>
 /// <param name="Detail">What happened, or why nothing did.</param>
 /// <param name="HttpStatus">Status of POST /webhookfx; null when no request was sent.</param>

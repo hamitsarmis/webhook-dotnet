@@ -6,7 +6,8 @@ namespace WebhookFx.Mcp;
 
 /// <summary>
 /// Everything the server reads from its environment. The two trading switches fail safe:
-/// only the exact value "false" turns dry-run off, only the exact value "true" allows live.
+/// only the word "false" turns dry-run off and only the word "true" allows live (casing and
+/// surrounding spaces do not matter). Any other value, a typo included, keeps the safe setting.
 /// </summary>
 public sealed record McpSettings
 {
